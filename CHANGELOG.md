@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-26
+
+### Added
+- **`Page.startScreencast` / `stopScreencast` / `screencastFrameAck`** — CDP screencast with generation-token frame suppression. The document generation is driven by the DOM-mutation journal plus a dirty flag set by every live-element binding, so read-only evals emit no frames; a frame is emitted only when the document changed and the previous one was acked. The pump exits when the client disconnects (`EventSender::is_closed` probe + Drop guard), capture failures skip the tick instead of emitting blank frames, and resize/encode/base64 run via `spawn_blocking`.
+- **`OXI.getInteractiveElements`** — document-order interactive elements (a/button/input/select/textarea, `onclick`, interactive roles, `tabindex ≥ 0`) with computed roles, trimmed text, and unique CSS selector paths; ids that are not valid CSS identifiers fall back to the `[id="…"]` attribute form.
+- **Web APIs in the JS runtime** — `matchMedia` (min/max-width against the session viewport), `DOMParser.parseFromString` (HTML, detached document object), `structuredClone` (objects/arrays/Date/RegExp/Map/Set, `DataCloneError` on functions), and `requestIdleCallback`/`cancelIdleCallback` on the timer machinery.
+- **Real multi-page PDF** — `oxibrowser_render::png_to_pdf_paged(png, &PdfPageOptions)` slices the full-page raster into A4/Letter pages (portrait/landscape, margins) with white-padded final pages; `Page.printToPDF` now honors `landscape`, margin params, and `paperWidth`. Failure paths surface as `Result<Vec<u8>, RenderError>` instead of an empty document, and printpdf warnings are logged.
+- **`skills/` directory** — agent self-install (`oxibrowser-install`) and webfetch (`oxibrowser-webfetch`) skill guides.
+
+### Fixed
+- **JS-thread stack overflow on live element results** — element objects exposed enumerable tree accessors (`firstChild`/`nextSibling`) and enumerable reference-cycling data props (`children`/`parentNode`); `JSON.stringify` inside `js_value_to_json` walked them without termination and killed the eval. Tree accessors and `children`/`parentNode` are now non-enumerable (same treatment as the `document` object), so a live element as the final eval result serializes safely.
+- **Timer delay overflow** — `requestIdleCallback`/`setTimeout`/`setInterval` clamp non-finite or huge delays (`{timeout: Infinity}` used to saturate to `u64::MAX` and overflow `Instant` arithmetic, panicking the binding) and use saturating deadline arithmetic.
+- **16-bit PNG decode in the PDF path** — `normalize_to_color8` alone left 16-bit samples at 2 bytes, garbling page slices; the decoder now strips 16-bit and rejects undecodable input instead of emitting garbled pages.
+- **Screencast margin params in `printToPDF`** — margins average over the values actually provided; explicit zeros mean borderless rather than falling back to the 10 mm default.
+- **Stale roadmap** — `docs/roadmap-v0.5.md` (13.4k-LOC era) replaced by a living `docs/roadmap.md` reflecting the current 4-crate, Blitz-rendered engine.
+
 ## [0.21.1] - 2026-09-14
 
 ### Fixed
