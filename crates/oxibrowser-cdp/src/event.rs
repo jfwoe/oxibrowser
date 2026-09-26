@@ -51,6 +51,13 @@ pub fn event_channel() -> (EventSender, EventReceiver) {
 }
 
 impl EventSender {
+    /// Whether the event channel's receiver is gone (e.g. the client's
+    /// WebSocket dispatch loop ended) — further `send`s will fail. Cheap
+    /// disconnect probe for background emitters such as the screencast pump.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Send a CDP event to the client.
     pub fn send(&self, event: CdpEvent) {
         if let Err(e) = self.tx.send(event) {

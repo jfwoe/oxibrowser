@@ -6,13 +6,22 @@
 use crate::error::{CoreError, Result};
 use crate::frame::Frame;
 use crate::network::resource::Resource;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::info;
 use url::Url;
 
 /// Unique page ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(u32);
+
+/// Process-global document-generation source.
+///
+/// Navigations replace the `Page` object (`Session::navigate` builds a fresh
+/// `Page::from_html`), so a per-`Page` counter alone would restart at its seed
+/// and could repeat a generation the screencast already emitted. Seeding every
+/// page — and every [`Page::bump_generation`] — from this one counter keeps all
+/// generation values unique within the process.
+static GLOBAL_DOC_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl PageId {
     fn next() -> Self {
@@ -43,6 +52,11 @@ pub struct Page {
     resources: Vec<Resource>,
     /// Page title (extracted from <title>).
     title: Option<String>,
+    /// Document-generation token: differs whenever the document content has
+    /// changed (navigation creates a fresh `Page`; DOM/JS layers bump it via
+    /// [`Page::bump_generation`]). Screencast frame suppression compares this
+    /// token to skip emitting duplicate frames.
+    generation: AtomicU64,
 }
 
 impl Page {
@@ -70,6 +84,9 @@ impl Page {
             content_type,
             resources: Vec::new(),
             title,
+            // Navigation hook: a new document draws a never-before-seen
+            // generation from the process-global counter.
+            generation: AtomicU64::new(GLOBAL_DOC_GENERATION.fetch_add(1, Ordering::Relaxed)),
         })
     }
 
@@ -187,6 +204,28 @@ impl Page {
     /// Get the page ID.
     pub fn id(&self) -> PageId {
         self.id
+    }
+
+    /// Current document-generation token.
+    ///
+    /// Changes on navigation (a new `Page` is built with a fresh token) and
+    /// whenever a DOM-mutation or JS-evaluation layer calls
+    /// [`Page::bump_generation`]. Consumers (screencast) compare tokens to
+    /// detect document changes.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Bump the document-generation token: the document content changed.
+    ///
+    /// Public so higher layers (DOM mutation, JS evaluation) can mark the
+    /// document dirty for screencast frame suppression without owning the
+    /// page mutably. Returns the new token, which is unique within the
+    /// process (drawn from the same counter as fresh pages).
+    pub fn bump_generation(&self) -> u64 {
+        let next = GLOBAL_DOC_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        self.generation.store(next, Ordering::Relaxed);
+        next
     }
 }
 
@@ -346,5 +385,62 @@ mod tests {
         assert_eq!(page.resources().len(), 1);
         assert_eq!(page.resources()[0].url, "https://example.com/style.css");
         assert_eq!(page.resources()[0].resource_type, ResourceType::Stylesheet);
+    }
+
+    #[tokio::test]
+    async fn test_page_generation_unique_across_pages() {
+        // Navigations replace the Page object; each fresh page must carry a
+        // generation that no previously observed page had, or screencast would
+        // suppress the post-navigation frame as a "duplicate".
+        let url = Url::parse("https://example.com/").unwrap();
+        let a = Page::from_html(
+            url.clone(),
+            &make_test_html("Gen A"),
+            200,
+            "text/html".to_string(),
+        )
+        .await
+        .unwrap();
+        let b = Page::from_html(
+            url,
+            &make_test_html("Gen B"),
+            200,
+            "text/html".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(a.generation(), b.generation(), "fresh pages differ");
+    }
+
+    #[tokio::test]
+    async fn test_page_bump_generation_changes_token() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let page = Page::from_html(
+            url,
+            &make_test_html("Gen Bump"),
+            200,
+            "text/html".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let before = page.generation();
+        let bumped = page.bump_generation();
+        assert_ne!(bumped, before, "bump must move the token");
+        assert_eq!(page.generation(), bumped, "generation() reflects the bump");
+
+        // Bumped tokens stay in the same unique space as fresh-page tokens:
+        // a later page must not collide with any bumped generation.
+        let other = Page::from_html(
+            Url::parse("https://example.org/").unwrap(),
+            &make_test_html("Gen Other"),
+            200,
+            "text/html".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(other.generation(), before);
+        assert_ne!(other.generation(), bumped);
     }
 }

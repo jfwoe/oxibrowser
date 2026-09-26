@@ -2,7 +2,8 @@
 //!
 //! Handles Page.enable, Page.disable, Page.navigate, Page.reload,
 //! Page.getFrameTree, Page.getFrameMetrics, Page.captureScreenshot,
-//! Page.printToPDF.
+//! Page.printToPDF, and the screencast subset (Page.startScreencast,
+//! Page.stopScreencast, Page.screencastFrameAck).
 //!
 //! After Page.enable, navigation events are emitted:
 //! - Page.frameNavigated
@@ -22,7 +23,13 @@ use crate::domains::network;
 use crate::domains::{DispatchContext, DomainResult};
 use crate::event::EventSender;
 use crate::protocol::CdpError;
+use image::codecs::jpeg::JpegEncoder;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use tokio::sync::RwLock;
 
 /// Dispatch Page domain methods.
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
@@ -35,6 +42,9 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "getFrameMetrics" => get_frame_metrics(),
         "captureScreenshot" => capture_screenshot(params, ctx).await,
         "printToPDF" => print_to_pdf(params, ctx).await,
+        "startScreencast" => start_screencast(params, ctx).await,
+        "stopScreencast" => stop_screencast(ctx),
+        "screencastFrameAck" => screencast_frame_ack(params),
         "setDownloadBehavior" => set_download_behavior(params),
         "getLifecycleEvents" => Ok(Some(json!({ "events": [] }))),
         "setLifecycleEventsEnabled" => set_lifecycle_events_enabled(params, ctx),
@@ -488,12 +498,31 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
     })))
 }
 
+/// Resolve `Page.printToPDF` margins (inches) into one millimetre margin.
+///
+/// Only *provided* margins are averaged (inches → mm). When none is provided
+/// the 10 mm default applies; explicit zeros are honored as borderless rather
+/// than falling back to the default.
+fn margin_mm_from_params(params: &Value) -> f64 {
+    let provided: Vec<f64> = ["marginTop", "marginBottom", "marginLeft", "marginRight"]
+        .iter()
+        .filter_map(|k| params.get(*k).and_then(Value::as_f64))
+        .collect();
+    if provided.is_empty() {
+        10.0
+    } else {
+        provided.iter().sum::<f64>() / provided.len() as f64 * 25.4
+    }
+}
+
 /// Page.printToPDF — prints the page to PDF.
 ///
-/// Captures the rendered page (same path as `captureScreenshot`) and embeds
-/// the PNG in a single-page PDF via `printpdf`. The PDF page matches the
-/// captured image's aspect ratio. Parameters (paperWidth/Height, landscape,
-/// etc.) are accepted but ignored — the output is always one full-page image.
+/// Captures the full rendered page (same path as `captureScreenshot`) and
+/// slices it into pages via `png_to_pdf_paged`. Supported params: `landscape`
+/// (bool), `marginTop/-Bottom/-Left/-Right` (inches; the provided ones are
+/// averaged, falling back to the 10 mm default only when none is given), and
+/// `paperWidth` (mapped to Letter when within 0.25in of 8.5in, else A4).
+/// Header/footer, page ranges, and scale are accepted but ignored.
 async fn print_to_pdf(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params = params.unwrap_or_default();
     let viewport_width = params
@@ -509,7 +538,28 @@ async fn print_to_pdf(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
         .unwrap_or_else(|_| oxibrowser_core::blank_png(viewport_width.max(64), 800));
     drop(guard);
 
-    let pdf_bytes = oxibrowser_core::png_to_pdf(&png_bytes).unwrap_or_default();
+    let landscape = params
+        .get("landscape")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let margin_mm = margin_mm_from_params(&params);
+    let page_size = match params.get("paperWidth").and_then(|v| v.as_f64()) {
+        Some(w) if (w - 8.5).abs() < 0.25 => oxibrowser_core::PdfPageSize::Letter,
+        _ => oxibrowser_core::PdfPageSize::A4,
+    };
+    let opts = oxibrowser_core::PdfPageOptions {
+        page_size,
+        orientation: if landscape {
+            oxibrowser_core::PdfOrientation::Landscape
+        } else {
+            oxibrowser_core::PdfOrientation::Portrait
+        },
+        margin_mm,
+    };
+    let pdf_bytes = oxibrowser_core::png_to_pdf_paged(&png_bytes, &opts).map_err(|e| CdpError {
+        code: -32000,
+        message: format!("PDF render failed: {e}"),
+    })?;
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&pdf_bytes);
     Ok(Some(json!({ "data": data, "stream": "" })))
@@ -552,4 +602,629 @@ async fn handle_javascript_dialog(params: Option<Value>, ctx: &DispatchContext) 
         prompt_text,
     });
     Ok(Some(json!({})))
+}
+
+// ---------------------------------------------------------------------------
+// Screencast: Page.startScreencast / Page.screencastFrame / Page.stopScreencast
+// / Page.screencastFrameAck
+//
+// Frames are produced through the same capture path as `Page.captureScreenshot`
+// (`Session::capture_screenshot_png`, the live post-JS Blitz render) by a
+// per-stream background pump. Emission is flow-controlled like Chrome's:
+// a frame goes out only when the document generation changed AND the previous
+// frame was acked; `Page.screencastFrameAck` releases the next changed frame.
+// ---------------------------------------------------------------------------
+
+/// Base screencast tick period. `everyNthFrame` samples every Nth tick, so the
+/// effective frame period is `SCREENCAST_TICK_MS * everyNthFrame`. Deliberately
+/// modest: each frame is a full Blitz page render on the CPU.
+const SCREENCAST_TICK_MS: u64 = 100;
+
+/// Capture width passed to `Session::capture_screenshot_png` (layout uses the
+/// session's configured viewport; this mirrors `captureScreenshot`'s default).
+const SCREENCAST_CAPTURE_WIDTH: u32 = 1280;
+
+/// Parsed `Page.startScreencast` parameters (fixed for the stream's lifetime).
+#[derive(Clone, Copy, Debug)]
+struct ScreencastParams {
+    format: ScreencastFormat,
+    quality: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreencastFormat {
+    Jpeg,
+    Png,
+}
+
+impl ScreencastParams {
+    /// Parse with CDP defaults: jpeg format, jpeg quality 80, no resize.
+    fn from_params(params: &Value) -> Self {
+        let format = match params.get("format").and_then(Value::as_str) {
+            Some("png") => ScreencastFormat::Png,
+            _ => ScreencastFormat::Jpeg,
+        };
+        let quality = params
+            .get("quality")
+            .and_then(Value::as_u64)
+            .unwrap_or(80)
+            .clamp(0, 100) as u32;
+        let max_width = params
+            .get("maxWidth")
+            .and_then(Value::as_u64)
+            .map(|v| v.max(1) as u32);
+        let max_height = params
+            .get("maxHeight")
+            .and_then(Value::as_u64)
+            .map(|v| v.max(1) as u32);
+        Self {
+            format,
+            quality,
+            max_width,
+            max_height,
+        }
+    }
+}
+
+/// Emission decision for one screencast tick.
+#[derive(Debug, PartialEq, Eq)]
+enum ScreencastDecision {
+    Send,
+    Skip,
+}
+
+/// Pure generation/ack suppression state machine (screencast flow control).
+///
+/// - the first tick always samples, so the initial frame goes out promptly;
+/// - a frame is emitted only when the document generation differs from the
+///   last emitted one AND no previously emitted frame is still unacked;
+/// - ack releases the *next changed* frame — it never resends an unchanged one;
+/// - with `every_nth_frame > 1`, changes are only sampled every Nth tick
+///   (the first tick excepted); ticks blocked on an ack still count, so the
+///   change observed just before the ack is released immediately.
+struct ScreencastGate {
+    every_nth_frame: u32,
+    ticks_since_frame: u32,
+    last_emitted_generation: Option<u64>,
+    pending_ack: bool,
+}
+
+impl ScreencastGate {
+    fn new(every_nth_frame: u32) -> Self {
+        Self {
+            every_nth_frame: every_nth_frame.max(1),
+            ticks_since_frame: 0,
+            last_emitted_generation: None,
+            pending_ack: false,
+        }
+    }
+
+    /// Evaluate one pump tick against the current document generation.
+    fn on_tick(&mut self, generation: u64) -> ScreencastDecision {
+        self.ticks_since_frame = self.ticks_since_frame.saturating_add(1);
+        let sample =
+            self.last_emitted_generation.is_none() || self.ticks_since_frame >= self.every_nth_frame;
+        if !sample {
+            return ScreencastDecision::Skip;
+        }
+        let changed = self.last_emitted_generation != Some(generation);
+        if changed && !self.pending_ack {
+            ScreencastDecision::Send
+        } else {
+            ScreencastDecision::Skip
+        }
+    }
+
+    /// Record an emitted frame: store its generation, restart the sampling
+    /// cadence, and gate further frames until the client acks.
+    fn on_frame_sent(&mut self, generation: u64) {
+        self.last_emitted_generation = Some(generation);
+        self.ticks_since_frame = 0;
+        self.pending_ack = true;
+    }
+
+    /// Apply `Page.screencastFrameAck`. Returns false when no frame was
+    /// pending (duplicate ack); the registry-level unknown-sessionId case is
+    /// handled by the caller.
+    fn on_ack(&mut self) -> bool {
+        if self.pending_ack {
+            self.pending_ack = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// An active screencast stream.
+struct ScreencastStream {
+    /// Owning target session, identified by the `Arc` pointer of its core
+    /// `Session` — stable for the session's lifetime, scopes `stopScreencast`.
+    owner: usize,
+    gate: Arc<Mutex<ScreencastGate>>,
+    /// Cleared by `stopScreencast` (or session close) to end the pump.
+    active: Arc<AtomicBool>,
+}
+
+/// Registry of active screencasts, keyed by screencast sessionId. Keys are
+/// process-unique UUIDs, so concurrent connections never collide; lookups by
+/// sessionId (`screencastFrameAck`) are therefore unambiguous.
+static SCREENCASTS: LazyLock<Mutex<HashMap<String, ScreencastStream>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Lock the screencast registry, recovering from poisoning (a panic in one
+/// handler must not permanently break screencast for the process).
+fn screencasts() -> MutexGuard<'static, HashMap<String, ScreencastStream>> {
+    SCREENCASTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `Page.startScreencast` — begin streaming frames of the live document.
+///
+/// Registers a stream and spawns its pump; frames arrive as
+/// `Page.screencastFrame` events carrying this stream's `sessionId`, which the
+/// client must echo back in `Page.screencastFrameAck`.
+async fn start_screencast(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let stream_params = ScreencastParams::from_params(&params);
+    let every_nth_frame = params
+        .get("everyNthFrame")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as u32;
+
+    let stream_id = format!("screencast-{}", uuid::Uuid::new_v4().as_simple());
+    let gate = Arc::new(Mutex::new(ScreencastGate::new(every_nth_frame)));
+    let active = Arc::new(AtomicBool::new(true));
+
+    screencasts().insert(
+        stream_id.clone(),
+        ScreencastStream {
+            owner: Arc::as_ptr(&ctx.session) as usize,
+            gate: gate.clone(),
+            active: active.clone(),
+        },
+    );
+
+    let session = ctx.session.clone();
+    let events = ctx.events.clone();
+    let sid = stream_id;
+    tokio::spawn(screencast_pump(session, events, sid, gate, active, stream_params));
+
+    Ok(Some(json!({})))
+}
+
+/// Registry-entry lifetime guard for one screencast pump. Removing the entry
+/// on drop means the registry can never outlive its pump: the pump removes
+/// its own entry on every exit path — `stopScreencast`, session close, client
+/// disconnect, or a panic unwinding out of the task.
+struct ScreencastPumpGuard {
+    stream_id: String,
+}
+
+impl Drop for ScreencastPumpGuard {
+    fn drop(&mut self) {
+        screencasts().remove(&self.stream_id);
+    }
+}
+
+/// Background pump for one screencast stream: ticks every
+/// `SCREENCAST_TICK_MS`, and when the gate releases a frame, captures the live
+/// document (same path as `Page.captureScreenshot`), resizes/encodes it, and
+/// emits `Page.screencastFrame`. Ends — removing the registry entry via
+/// `ScreencastPumpGuard` — when `stopScreencast` clears `active`, the owning
+/// session closes, or the event channel closes (client gone).
+async fn screencast_pump(
+    session: Arc<RwLock<oxibrowser_core::session::Session>>,
+    events: EventSender,
+    stream_id: String,
+    gate: Arc<Mutex<ScreencastGate>>,
+    active: Arc<AtomicBool>,
+    params: ScreencastParams,
+) {
+    let _registry = ScreencastPumpGuard {
+        stream_id: stream_id.clone(),
+    };
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(SCREENCAST_TICK_MS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if !active.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // The client vanished (WebSocket dispatch loop dropped the event
+        // receiver): stop rendering and release the registry entry instead of
+        // pumping full-page renders at 10 Hz into a closed channel.
+        if events.is_closed() {
+            break;
+        }
+
+        // The document generation drives emission; a closed session ends the
+        // pump (clients that stop screencasting go through stopScreencast).
+        let generation = {
+            let guard = session.read().await;
+            if guard.is_closed() {
+                break;
+            }
+            guard.page().map(|p| p.generation())
+        };
+        let Some(generation) = generation else {
+            continue;
+        };
+
+        let send = gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .on_tick(generation);
+        if send != ScreencastDecision::Send {
+            continue;
+        }
+
+        let png = {
+            let mut guard = session.write().await;
+            guard.capture_screenshot_png(SCREENCAST_CAPTURE_WIDTH).await
+        };
+        if !active.load(Ordering::Relaxed) {
+            break;
+        }
+        // A failed capture is logged and skipped: nothing is emitted and the
+        // generation stays unsent, so the next tick retries the render.
+        let Some(png) = screencast_capture_png(&stream_id, png) else {
+            continue;
+        };
+        // Resize + JPEG/PNG encode + base64 are pure CPU work on an owned
+        // buffer: run them off the async worker.
+        let frame = tokio::task::spawn_blocking(move || encode_screencast_frame(&png, params))
+            .await
+            .ok()
+            .flatten();
+        let Some((data, width, height)) = frame else {
+            tracing::warn!(session_id = %stream_id, "screencast frame encode failed");
+            continue;
+        };
+
+        gate.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .on_frame_sent(generation);
+        events.send_event(
+            "Page.screencastFrame",
+            json!({
+                "data": data,
+                "metadata": {
+                    "offsetTop": 0,
+                    "pageScaleFactor": 1,
+                    "viewportWidth": width,
+                    "viewportHeight": height,
+                    "timestamp": EventSender::timestamp_ms(),
+                },
+                "sessionId": stream_id,
+            }),
+        );
+    }
+}
+
+/// Resolve one tick's screencast capture into a PNG ready for encoding.
+///
+/// `None` (capture failed) skips the tick: the pump never substitutes a
+/// fabricated blank frame for a real render, and since the tick's generation
+/// is only recorded on successful emission, the next tick retries.
+fn screencast_capture_png(
+    stream_id: &str,
+    png: Result<Vec<u8>, oxibrowser_core::error::CoreError>,
+) -> Option<Vec<u8>> {
+    match png {
+        Ok(png) => Some(png),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %stream_id,
+                error = %e,
+                "screencast capture failed; skipping tick"
+            );
+            None
+        }
+    }
+}
+
+/// `Page.stopScreencast` — stop the screencast(s) started on this session.
+/// Silent no-op when none is active (matches CDP semantics; takes no params).
+fn stop_screencast(ctx: &DispatchContext) -> DomainResult {
+    let owner = Arc::as_ptr(&ctx.session) as usize;
+    let mut streams = screencasts();
+    let stopped: Vec<String> = streams
+        .iter()
+        .filter(|(_, s)| s.owner == owner)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stopped {
+        if let Some(stream) = streams.remove(&id) {
+            stream.active.store(false, Ordering::Relaxed);
+        }
+    }
+    Ok(Some(json!({})))
+}
+
+/// `Page.screencastFrameAck` — release the next changed frame for a stream.
+fn screencast_frame_ack(params: Option<Value>) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let stream_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "screencastFrameAck requires parameters: sessionId".to_string(),
+        })?;
+    let streams = screencasts();
+    match streams.get(stream_id) {
+        Some(stream) => {
+            stream
+                .gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .on_ack();
+            Ok(Some(json!({})))
+        }
+        None => Err(CdpError {
+            code: -32601,
+            message: format!("sessionId not found: {stream_id}"),
+        }),
+    }
+}
+
+/// Resize (never upscale), encode, and base64 one captured PNG frame.
+/// Returns `(data, width, height)` of the encoded frame.
+fn encode_screencast_frame(png: &[u8], params: ScreencastParams) -> Option<(String, u32, u32)> {
+    use base64::Engine;
+    let mut img = image::load_from_memory(png).ok()?;
+    if params.max_width.is_some() || params.max_height.is_some() {
+        // Fit within the bounds preserving aspect ratio; Chrome only
+        // downscales screencast frames, so never enlarge.
+        let max_w = params.max_width.unwrap_or(u32::MAX).max(1) as f64;
+        let max_h = params.max_height.unwrap_or(u32::MAX).max(1) as f64;
+        let scale = (max_w / img.width().max(1) as f64)
+            .min(max_h / img.height().max(1) as f64)
+            .min(1.0);
+        if scale < 1.0 {
+            let new_w = ((img.width() as f64 * scale).round() as u32).max(1);
+            let new_h = ((img.height() as f64 * scale).round() as u32).max(1);
+            img = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+        }
+    }
+    let (width, height) = (img.width(), img.height());
+    let mut encoded = Vec::new();
+    match params.format {
+        ScreencastFormat::Jpeg => {
+            let mut encoder =
+                JpegEncoder::new_with_quality(&mut encoded, params.quality.clamp(0, 100) as u8);
+            encoder
+                .encode(img.to_rgb8().as_raw(), width, height, image::ExtendedColorType::Rgb8)
+                .ok()?;
+        }
+        ScreencastFormat::Png => {
+            img.write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Png)
+                .ok()?;
+        }
+    }
+    Some((
+        base64::engine::general_purpose::STANDARD.encode(&encoded),
+        width,
+        height,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn test_screencast_gate_sends_first_frame() {
+        let mut gate = ScreencastGate::new(1);
+        assert_eq!(gate.on_tick(10), ScreencastDecision::Send);
+        gate.on_frame_sent(10);
+    }
+
+    #[test]
+    fn test_screencast_gate_suppresses_unchanged_generation() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(10);
+        gate.on_frame_sent(10);
+        assert_eq!(gate.on_tick(10), ScreencastDecision::Skip);
+    }
+
+    #[test]
+    fn test_screencast_gate_sends_on_changed_generation() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(10);
+        gate.on_frame_sent(10);
+        gate.on_ack(); // client released the first frame
+        assert_eq!(gate.on_tick(11), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_gate_holds_until_ack_then_releases_changed_frame() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(10);
+        gate.on_frame_sent(10);
+        // Document changed, but the emitted frame is unacked: nothing further.
+        assert_eq!(gate.on_tick(11), ScreencastDecision::Skip);
+        // Ack releases the next CHANGED frame.
+        assert!(gate.on_ack());
+        assert_eq!(gate.on_tick(11), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_gate_ack_does_not_resend_unchanged_frame() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(10);
+        gate.on_frame_sent(10);
+        assert!(gate.on_ack());
+        assert_eq!(gate.on_tick(10), ScreencastDecision::Skip);
+        assert_eq!(gate.on_tick(12), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_gate_duplicate_ack_reports_not_pending() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(1);
+        gate.on_frame_sent(1);
+        assert!(gate.on_ack());
+        assert!(!gate.on_ack());
+    }
+
+    #[test]
+    fn test_screencast_gate_every_nth_frame_samples_changes() {
+        let mut gate = ScreencastGate::new(3);
+        gate.on_tick(1);
+        gate.on_frame_sent(1);
+        gate.on_ack(); // first frame released
+        // Changes on ticks 1-2 fall between samples; tick 3 releases the latest.
+        assert_eq!(gate.on_tick(2), ScreencastDecision::Skip);
+        assert_eq!(gate.on_tick(3), ScreencastDecision::Skip);
+        assert_eq!(gate.on_tick(4), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_gate_first_tick_bypasses_every_nth_sampling() {
+        let mut gate = ScreencastGate::new(5);
+        assert_eq!(gate.on_tick(7), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_gate_pending_ack_does_not_consume_the_sample_slot() {
+        let mut gate = ScreencastGate::new(1);
+        gate.on_tick(1);
+        gate.on_frame_sent(1);
+        // Changed while unacked, then acked: the same change is released on
+        // the very next tick (blocked ticks keep the gate ready to sample).
+        assert_eq!(gate.on_tick(2), ScreencastDecision::Skip);
+        gate.on_ack();
+        assert_eq!(gate.on_tick(2), ScreencastDecision::Send);
+    }
+
+    #[test]
+    fn test_screencast_params_defaults_to_jpeg_quality_80() {
+        let params = ScreencastParams::from_params(&json!({}));
+        assert_eq!(params.format, ScreencastFormat::Jpeg);
+        assert_eq!(params.quality, 80);
+        assert_eq!(params.max_width, None);
+        assert_eq!(params.max_height, None);
+    }
+
+    #[test]
+    fn test_screencast_params_png_and_quality_clamped() {
+        let params = ScreencastParams::from_params(&json!({ "format": "png", "quality": 250 }));
+        assert_eq!(params.format, ScreencastFormat::Png);
+        assert_eq!(params.quality, 100);
+        let params = ScreencastParams::from_params(&json!({ "quality": 0 }));
+        assert_eq!(params.format, ScreencastFormat::Jpeg);
+        assert_eq!(params.quality, 0);
+    }
+
+    #[test]
+    fn test_screencast_params_max_dimensions() {
+        let params =
+            ScreencastParams::from_params(&json!({ "maxWidth": 640, "maxHeight": 480 }));
+        assert_eq!(params.max_width, Some(640));
+        assert_eq!(params.max_height, Some(480));
+    }
+
+    #[test]
+    fn test_encode_screencast_frame_png_respects_max_dimensions() {
+        let png = oxibrowser_core::blank_png(800, 600);
+        let params =
+            ScreencastParams::from_params(&json!({ "format": "png", "maxWidth": 400, "maxHeight": 400 }));
+        let (data, width, height) = encode_screencast_frame(&png, params).expect("encode");
+        assert_eq!((width, height), (400, 300), "aspect preserved, downscaled");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .expect("valid base64");
+        assert_eq!(&decoded[..4], &[0x89, b'P', b'N', b'G'], "png format");
+    }
+
+    #[test]
+    fn test_encode_screencast_frame_jpeg_never_upscales() {
+        let png = oxibrowser_core::blank_png(320, 200);
+        let params = ScreencastParams::from_params(
+            &json!({ "format": "jpeg", "quality": 40, "maxWidth": 800, "maxHeight": 800 }),
+        );
+        let (data, width, height) = encode_screencast_frame(&png, params).expect("encode");
+        assert_eq!((width, height), (320, 200), "smaller frame stays put");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .expect("valid base64");
+        assert_eq!(
+            &decoded[..3],
+            &[0xFF, 0xD8, 0xFF],
+            "jpeg SOI marker with quality path"
+        );
+    }
+
+    // -- Page.printToPDF margins (provided-only averaging) --
+
+    #[test]
+    fn test_print_to_pdf_margin_defaults_when_none_provided() {
+        assert_eq!(margin_mm_from_params(&json!({})), 10.0);
+        // Non-margin params do not count as provided.
+        assert_eq!(margin_mm_from_params(&json!({ "landscape": true })), 10.0);
+    }
+
+    #[test]
+    fn test_print_to_pdf_margin_averages_only_provided_values() {
+        // A single provided margin is not quartered.
+        let one = margin_mm_from_params(&json!({ "marginTop": 1.0 }));
+        assert!((one - 25.4).abs() < 1e-9, "1in alone must stay 25.4mm, got {one}");
+        let two =
+            margin_mm_from_params(&json!({ "marginTop": 1.0, "marginBottom": 2.0 }));
+        assert!(
+            (two - 38.1).abs() < 1e-9,
+            "mean of 1in+2in must be 38.1mm, got {two}"
+        );
+    }
+
+    #[test]
+    fn test_print_to_pdf_margin_explicit_zeros_mean_borderless() {
+        let m = margin_mm_from_params(&json!({
+            "marginTop": 0.0,
+            "marginBottom": 0.0,
+            "marginLeft": 0.0,
+            "marginRight": 0.0,
+        }));
+        assert_eq!(
+            m, 0.0,
+            "explicit zeros must be honored, not fall back to the 10mm default"
+        );
+    }
+
+    // -- Screencast capture failure (no blank-frame substitution) --
+
+    #[test]
+    fn test_screencast_capture_failure_yields_no_frame() {
+        let failed = Err(oxibrowser_core::error::CoreError::ScreenshotError(
+            "render failed".to_string(),
+        ));
+        assert!(
+            screencast_capture_png("sc-1", failed).is_none(),
+            "a failed capture must never fabricate a blank frame"
+        );
+        let ok = Ok(oxibrowser_core::blank_png(640, 480));
+        assert!(screencast_capture_png("sc-1", ok).is_some());
+    }
+
+    #[test]
+    fn test_screencast_gate_retries_generation_after_skipped_capture() {
+        // Tick 1 releases the frame but the capture fails: no emission, no
+        // on_frame_sent — the same generation is released again next tick.
+        let mut gate = ScreencastGate::new(1);
+        assert_eq!(gate.on_tick(10), ScreencastDecision::Send);
+        // (capture fails here — nothing emitted, generation not recorded)
+        assert_eq!(
+            gate.on_tick(10),
+            ScreencastDecision::Send,
+            "an unsent generation must be retried, not suppressed"
+        );
+        gate.on_frame_sent(10);
+        assert_eq!(gate.on_tick(10), ScreencastDecision::Skip);
+    }
 }

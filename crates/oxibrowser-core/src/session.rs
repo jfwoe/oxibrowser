@@ -1241,7 +1241,13 @@ impl Session {
         // bindings themselves — no mutation log to drain/apply. Only
         // JS-triggered navigation (location.href / assign / reload) is still
         // signalled via the mutation channel, because it needs async network I/O.
-        for m in self.js_runtime.drain_mutations() {
+        // Take the dirty flag BEFORE the drain: RenderDocument-direct
+        // bindings set it instead of journaling, so ordering doesn't lose
+        // either signal for this eval.
+        let dom_dirty = self.js_runtime.take_dom_dirty();
+        let drained = self.js_runtime.drain_mutations();
+        let had_mutations = !drained.is_empty();
+        for m in drained {
             match m {
                 DomMutation::Navigate { url } => {
                     tracing::debug!(url = %url, "JS-triggered navigation");
@@ -1253,6 +1259,17 @@ impl Session {
                 }
                 _ => {} // DOM edits handled directly on the RenderDocument.
             }
+        }
+
+        // Screencast generation: journaling bindings leave a non-empty drain,
+        // but bindings that mutate the RenderDocument directly (render-element
+        // textContent/setAttribute/appendChild/style/click, etc.) only set the
+        // shared dom_dirty flag — either signal means the document changed.
+        // Read-only evals cost no extra frame.
+        if (had_mutations || dom_dirty)
+            && let Some(page) = self.page_mut()
+        {
+            page.bump_generation();
         }
 
         Ok(result)

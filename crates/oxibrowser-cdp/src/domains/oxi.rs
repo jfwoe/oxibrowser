@@ -5,6 +5,7 @@
 //! - `OXI.getPageInfo` — URL, title, status
 //! - `OXI.getStructuredPage` — headings, links, meta as structured JSON
 //! - `OXI.getAccessibilityTree` — semantic tree of what's on the page
+//! - `OXI.getInteractiveElements` — interactive elements in document order
 //! - `OXI.getBoxModelScreenshot` — PNG with colored boxes for each element
 
 use crate::domains::{DispatchContext, DomainResult};
@@ -18,6 +19,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "getPageInfo" => get_page_info(ctx).await,
         "getStructuredPage" => get_structured_page(params, ctx).await,
         "getAccessibilityTree" => get_accessibility_tree(ctx).await,
+        "getInteractiveElements" => get_interactive_elements(ctx).await,
         "getBoxModelScreenshot" => get_box_model_screenshot(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
@@ -124,6 +126,24 @@ async fn get_accessibility_tree(ctx: &DispatchContext) -> DomainResult {
     };
 
     Ok(Some(json!({ "tree": tree })))
+}
+
+/// OXI.getInteractiveElements — list interactive elements in document order.
+///
+/// One entry per element that is interactive: tag in
+/// a/button/input/select/textarea, an `onclick` attribute, an interactive
+/// `role` (button/link/tab/checkbox/radio), or `tabindex >= 0`. Detection and
+/// role/selector computation live in `oxibrowser_core::js::dom_snapshot`.
+async fn get_interactive_elements(ctx: &DispatchContext) -> DomainResult {
+    let mut guard = ctx.session.write().await;
+    let snapshot = guard.dom_snapshot().await?;
+
+    let elements = match snapshot {
+        Some(s) => s.interactive_elements(),
+        None => vec![],
+    };
+
+    Ok(Some(json!({ "elements": elements })))
 }
 
 /// OXI.getBoxModelScreenshot — PNG with colored boxes for each element.

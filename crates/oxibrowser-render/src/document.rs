@@ -21,6 +21,8 @@ pub type NodeId = usize;
 pub enum RenderError {
     /// Blitz/Stylo/vello_cpu reported an error.
     Render(String),
+    /// PNG decoding failed (invalid data or unsupported format).
+    Decode(String),
     /// PNG encoding failed.
     Encode(String),
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RenderError::Render(m) => write!(f, "render error: {m}"),
+            RenderError::Decode(m) => write!(f, "png decode error: {m}"),
             RenderError::Encode(m) => write!(f, "png encode error: {m}"),
         }
     }

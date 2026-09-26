@@ -174,3 +174,82 @@ fn png_to_pdf_wraps_png_in_valid_pdf() {
         String::from_utf8_lossy(&pdf[..8.min(pdf.len())])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Paged PDF output (png_to_pdf_paged)
+// ---------------------------------------------------------------------------
+
+use oxibrowser_render::{PdfOrientation, PdfPageOptions, PdfPageSize, png_to_pdf_paged};
+
+/// A4 portrait with 10 mm margins: content box 190 × 277 mm. An image scaled
+/// to 190 px wide has 1 px/mm, so one page's content height is exactly 277
+/// scaled rows and `n_pages = ceil(height / 277)`.
+#[test]
+fn png_to_pdf_paged_a4_page_count_matches_px_mm_arithmetic() {
+    let opts = PdfPageOptions {
+        page_size: PdfPageSize::A4,
+        orientation: PdfOrientation::Portrait,
+        margin_mm: 10.0,
+    };
+
+    // Exact multiple: 2770 rows / 277 rows-per-page = 10 pages.
+    let pdf = png_to_pdf_paged(&blank_png(190, 2770), &opts).expect("valid PNG must paginate");
+    assert!(pdf.starts_with(b"%PDF"), "PDF header missing");
+    assert_eq!(count_page_objects(&pdf), 10, "2770px @ A4/m10 == 10 pages");
+
+    // Remainder: ceil(3000 / 277) = 11 pages (last one padded white).
+    let pdf = png_to_pdf_paged(&blank_png(190, 3000), &opts).expect("valid PNG must paginate");
+    assert!(pdf.starts_with(b"%PDF"), "PDF header missing");
+    assert_eq!(count_page_objects(&pdf), 11, "3000px @ A4/m10 == 11 pages");
+
+    // Shorter than one page: exactly 1 page.
+    let pdf = png_to_pdf_paged(&blank_png(190, 100), &opts).expect("valid PNG must paginate");
+    assert_eq!(count_page_objects(&pdf), 1, "100px @ A4/m10 == 1 page");
+}
+
+/// Letter portrait with 10 mm margins: content 195.9 × 259.4 mm; a 190 px
+/// wide image covers round(259.4 · 190/195.9) = 252 rows per page.
+#[test]
+fn png_to_pdf_paged_letter_page_count() {
+    let opts = PdfPageOptions {
+        page_size: PdfPageSize::Letter,
+        orientation: PdfOrientation::Portrait,
+        margin_mm: 10.0,
+    };
+    let pdf = png_to_pdf_paged(&blank_png(190, 2520), &opts).expect("valid PNG must paginate");
+    assert_eq!(count_page_objects(&pdf), 10, "2520px @ Letter/m10 == 10 pages");
+}
+
+/// A4 landscape with 10 mm margins: content 277 × 190 mm; a 190 px wide image
+/// covers round(190 · 190/277) = 130 rows per page.
+#[test]
+fn png_to_pdf_paged_landscape_page_count() {
+    let opts = PdfPageOptions {
+        page_size: PdfPageSize::A4,
+        orientation: PdfOrientation::Landscape,
+        margin_mm: 10.0,
+    };
+    let pdf = png_to_pdf_paged(&blank_png(190, 1300), &opts).expect("valid PNG must paginate");
+    assert_eq!(count_page_objects(&pdf), 10, "1300px @ A4-landscape/m10 == 10 pages");
+}
+
+/// Undecodable input must surface as `Err`, not collapse into an empty PDF.
+#[test]
+fn png_to_pdf_paged_rejects_undecodable_png() {
+    let opts = PdfPageOptions::default();
+    let err = png_to_pdf_paged(b"not a png", &opts)
+        .expect_err("garbage input must fail, not emit an empty document");
+    assert!(err.to_string().contains("png"), "unexpected error: {err}");
+}
+
+/// Heuristic page count from raw PDF bytes: every page object carries
+/// `/Type/Page`; the page-tree node `/Type/Pages` also contains that
+/// substring, so subtract its occurrences.
+fn count_page_objects(pdf: &[u8]) -> usize {
+    let page = pdf.windows(b"/Type/Page".len()).filter(|w| *w == b"/Type/Page").count();
+    let pages = pdf.windows(b"/Type/Pages".len()).filter(|w| *w == b"/Type/Pages").count();
+    page - pages
+}
+
+
+

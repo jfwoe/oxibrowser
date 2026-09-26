@@ -27,7 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use base64::Engine;
@@ -1194,6 +1194,11 @@ pub struct JsRuntime {
     console_output: Arc<RwLock<Vec<String>>>,
     /// Shared mutation buffer — JS thread pushes, main thread drains.
     mutations: Arc<RwLock<Vec<DomMutation>>>,
+    /// Shared render-document dirty flag. Bindings that mutate the
+    /// [`RenderDocument`] directly (see `create_render_element_object`) set
+    /// it on the JS thread without journaling a [`DomMutation`]; the main
+    /// thread takes it to detect document changes (screencast generation).
+    dom_dirty: Arc<AtomicBool>,
     /// Global variables tracked on the Rust side.
     globals: RwLock<HashMap<String, Value>>,
     /// Runtime configuration (limits, timeouts).
@@ -1215,10 +1220,12 @@ impl JsRuntime {
         let (cmd_tx, cmd_rx) = mpsc::channel::<JsCommand>();
         let console_output = Arc::new(RwLock::new(Vec::<String>::new()));
         let mutations = Arc::new(RwLock::new(Vec::<DomMutation>::new()));
+        let dom_dirty = Arc::new(AtomicBool::new(false));
 
         // Spawn JS thread
         let console_output_clone = console_output.clone();
         let mutations_clone = mutations.clone();
+        let dom_dirty_clone = dom_dirty.clone();
         let viewport = (config.viewport_width, config.viewport_height);
         let user_agent = config.user_agent.clone();
         let _local_storage = Arc::new(RwLock::new(HashMap::<String, String>::new()));
@@ -1229,6 +1236,7 @@ impl JsRuntime {
                     cmd_rx,
                     console_output_clone,
                     mutations_clone,
+                    dom_dirty_clone,
                     viewport,
                     None,
                     user_agent,
@@ -1240,6 +1248,7 @@ impl JsRuntime {
             cmd_tx,
             console_output,
             mutations,
+            dom_dirty,
             globals: RwLock::new(HashMap::new()),
             config,
             fetch_tx: None,
@@ -1439,6 +1448,16 @@ impl JsRuntime {
         std::mem::take(&mut *guard)
     }
 
+    /// Take and clear the render-document dirty flag.
+    ///
+    /// Set on the JS thread by bindings that mutate the [`RenderDocument`]
+    /// directly (see `create_render_element_object`) and therefore never
+    /// journal a [`DomMutation`]. Callers OR this with a non-empty
+    /// `drain_mutations()` to decide whether an eval changed the document.
+    pub fn take_dom_dirty(&mut self) -> bool {
+        self.dom_dirty.swap(false, Ordering::Relaxed)
+    }
+
     /// Set a global variable — injected into the persistent JS Context.
     pub fn set_global(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
@@ -1458,6 +1477,9 @@ impl JsRuntime {
     /// Set the DOM snapshot (called after navigate).
     pub fn set_dom_snapshot(&mut self, snapshot: Option<DomSnapshot>) {
         self.mutations.write().clear();
+        // New document: stale dirtiness from the previous page must not
+        // cost a spurious screencast frame.
+        self.dom_dirty.store(false, Ordering::Relaxed);
         let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
         if let Err(e) = self.cmd_tx.send(JsCommand::SetDom {
             snapshot: Box::new(snapshot),
@@ -1869,6 +1891,7 @@ fn js_thread_loop(
     cmd_rx: Receiver<JsCommand>,
     console_output: Arc<RwLock<Vec<String>>>,
     mutations: Arc<RwLock<Vec<DomMutation>>>,
+    dom_dirty: Arc<AtomicBool>,
     viewport: (u32, u32),
     _fetch_tx: Option<std::sync::mpsc::Sender<FetchRequestMsg>>,
     user_agent: String,
@@ -1889,6 +1912,7 @@ fn js_thread_loop(
         &console_output,
         &dom_snapshot,
         &mutations,
+        &dom_dirty,
         viewport,
         "",
         &user_agent,
@@ -1987,6 +2011,7 @@ fn js_thread_loop(
                                 &console_output,
                                 &dom_snapshot,
                                 &mutations,
+                                &dom_dirty,
                                 viewport,
                                 "",
                                 &user_agent,
@@ -2001,6 +2026,7 @@ fn js_thread_loop(
                                 &console_output,
                                 &cf.dom_snapshot_arc,
                                 &mutations,
+                                &dom_dirty,
                                 viewport,
                                 "",
                                 &user_agent,
@@ -2307,6 +2333,7 @@ fn js_thread_loop(
                     &console_output,
                     &child_dom_snapshot,
                     &mutations,
+                    &dom_dirty,
                     vp,
                     &base_url,
                     &user_agent,
@@ -3283,6 +3310,37 @@ fn settle_ws_error(id: u64, _message: String, ctx: &mut Context) {
         .build();
     ws_fire(&obj, "error", event.into(), ctx);
 }
+/// Sane upper bound for JS timer delays: 24 hours in milliseconds. Larger
+/// delays (e.g. `setTimeout(fn, Infinity)`) clamp here so the timer deadline
+/// never overflows `Instant`.
+const MAX_TIMER_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Clamp a JS-provided delay in ms to a schedulable `u64`.
+///
+/// NaN and negative values become 0 (fire immediately), finite values cap at
+/// [`MAX_TIMER_DELAY_MS`], and ±Infinity maps to the cap. Without this,
+/// `Infinity as u64` saturates to `u64::MAX` and the subsequent
+/// `Instant + Duration::from_millis` overflows and panics inside the native
+/// closure (killing the eval).
+fn clamp_delay_ms(v: f64) -> u64 {
+    if v.is_nan() || v <= 0.0 {
+        return 0;
+    }
+    if !v.is_finite() {
+        return MAX_TIMER_DELAY_MS;
+    }
+    // float→int casts saturate in Rust, so this cannot wrap.
+    (v as u64).min(MAX_TIMER_DELAY_MS)
+}
+
+/// Timer deadline `delay_ms` from now, saturating to `now` if the addition
+/// would overflow (unreachable with the [`MAX_TIMER_DELAY_MS`] clamp).
+fn timer_deadline_after(delay_ms: u64) -> Instant {
+    let now = Instant::now();
+    now.checked_add(Duration::from_millis(delay_ms))
+        .unwrap_or(now)
+}
+
 fn drain_timers(queue: &Rc<TokioJobQueue>, ctx: &mut Context) {
     // Settle any fetch/XHR responses first — they may enqueue microtasks or
     // timers that the rest of this drain must then process (Phase 3).
@@ -3374,6 +3432,7 @@ fn create_context(
     output: &Arc<RwLock<Vec<String>>>,
     dom_snapshot: &Arc<RwLock<Option<DomSnapshot>>>,
     mutations: &Arc<RwLock<Vec<DomMutation>>>,
+    dom_dirty: &Arc<AtomicBool>,
     viewport: (u32, u32),
     page_url: &str,
     user_agent: &str,
@@ -3469,13 +3528,13 @@ fn create_context(
                 return Ok(JsValue::undefined());
             }
             let callback = args[0].clone();
-            let delay_ms = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as u64;
+            let delay_ms = clamp_delay_ms(args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0));
             let cb_args: Vec<JsValue> = args[2..].to_vec();
 
             if let Some(func) = callback.as_object().cloned()
                 && func.is_callable()
             {
-                let deadline = Instant::now() + Duration::from_millis(delay_ms);
+                let deadline = timer_deadline_after(delay_ms);
                 let id = timer_queue_st.schedule_timer(deadline, func, cb_args, false, None);
                 return Ok(JsValue::from(id as f64));
             }
@@ -3490,13 +3549,13 @@ fn create_context(
                 return Ok(JsValue::undefined());
             }
             let callback = args[0].clone();
-            let delay_ms = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as u64;
+            let delay_ms = clamp_delay_ms(args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0));
             let cb_args: Vec<JsValue> = args[2..].to_vec();
 
             if let Some(func) = callback.as_object().cloned()
                 && func.is_callable()
             {
-                let deadline = Instant::now() + Duration::from_millis(delay_ms);
+                let deadline = timer_deadline_after(delay_ms);
                 let id =
                     timer_queue_si.schedule_timer(deadline, func, cb_args, true, Some(delay_ms));
                 return Ok(JsValue::from(id as f64));
@@ -4275,6 +4334,7 @@ fn create_context(
         &mut context,
         dom_snapshot,
         mutations,
+        dom_dirty,
         cookie_jar_arc,
         render_doc_cell,
     );
@@ -5130,6 +5190,90 @@ fn create_context(
     };
     let _ = context.register_global_callable(js_string!("cancelAnimationFrame"), 1, cancel_raf_fn);
 
+    // --- requestIdleCallback / cancelIdleCallback ---
+    //
+    // Scheduled through the same TokioJobQueue machinery as setTimeout: the
+    // callback fires on the next timer drain with a minimal IdleDeadline
+    // ({ didTimeout: false, timeRemaining(): 0 }). `options.timeout` delays
+    // firing the way a setTimeout delay would; cancelIdleCallback cancels by
+    // the returned handle, exactly like clearTimeout.
+    let ric_queue = job_queue.clone();
+    let request_idle_callback_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            let Some(callback) = args.first().cloned() else {
+                return Ok(JsValue::undefined());
+            };
+            if let Some(func) = callback.as_object().cloned()
+                && func.is_callable()
+            {
+                let timeout_ms = args
+                    .get(1)
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get(js_string!("timeout"), ctx).ok())
+                    .and_then(|v| v.as_number())
+                    .map(clamp_delay_ms)
+                    .unwrap_or(0);
+                let time_remaining_fn =
+                    NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::from(0.0)));
+                let deadline_obj = boa_engine::object::ObjectInitializer::new(ctx)
+                    .property(
+                        js_string!("didTimeout"),
+                        JsValue::from(false),
+                        Attribute::all(),
+                    )
+                    .function(time_remaining_fn, js_string!("timeRemaining"), 0)
+                    .build();
+                let deadline = timer_deadline_after(timeout_ms);
+                let id = ric_queue.schedule_timer(
+                    deadline,
+                    func,
+                    vec![JsValue::from(deadline_obj)],
+                    false,
+                    None,
+                );
+                return Ok(JsValue::from(id as f64));
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let _ = context.register_global_callable(
+        js_string!("requestIdleCallback"),
+        1,
+        request_idle_callback_fn,
+    );
+
+    let cancel_ric_queue = job_queue.clone();
+    let cancel_idle_callback_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            if let Some(id) = args.first().and_then(|v| v.as_number()) {
+                cancel_ric_queue.cancel_timer(id as u64);
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let _ = context.register_global_callable(
+        js_string!("cancelIdleCallback"),
+        1,
+        cancel_idle_callback_fn,
+    );
+
+    // Mirror the idle-callback helpers onto `window` (globalThis and window
+    // are distinct objects; feature detection reads
+    // `window.requestIdleCallback`). window is rebuilt per navigation and
+    // re-seeded by the Object.assign copy in HISTORY_LOCATION_BOOTSTRAP.
+    {
+        let globals = context.global_object().clone();
+        if let Ok(win_val) = globals.get(js_string!("window"), &mut context)
+            && let Some(win_obj) = win_val.as_object()
+        {
+            for name in ["requestIdleCallback", "cancelIdleCallback"] {
+                if let Ok(v) = globals.get(JsString::from(name), &mut context) {
+                    let _ = win_obj.set(JsString::from(name), v, true, &mut context);
+                }
+            }
+        }
+    }
+
     // --- Event constructor ---
 
     // ── Event init-dict helpers ──────────────────────────────────────────────
@@ -5589,10 +5733,15 @@ fn create_context(
 /// `textContent`, `id`, `className`. Each method takes a short borrow of the
 /// shared `Rc<RefCell<Option<RenderDocument>>>` — never held across a JS
 /// callback — so the document stays borrowable for the next operation.
+///
+/// Every binding that applies a mutation also sets the shared `dom_dirty`
+/// flag, so the session layer can bump the screencast frame generation even
+/// though nothing was journaled.
 fn create_render_element_object(
     ctx: &mut Context,
     render_doc: Rc<RefCell<Option<RenderDocument>>>,
     node_id: usize,
+    dom_dirty: Arc<AtomicBool>,
 ) -> JsValue {
     let tag = render_doc
         .borrow()
@@ -5603,6 +5752,7 @@ fn create_render_element_object(
 
     // ── attribute methods ──
     let rd_set = render_doc.clone();
+    let dirty_set = dom_dirty.clone();
     let set_attr_fn = unsafe {
         NativeFunction::from_closure(move |this: &JsValue, args, ctx| {
             let name = args
@@ -5621,6 +5771,7 @@ fn create_render_element_object(
                 .and_then(|d| d.node_attr(node_id, &name));
             if let Some(doc) = rd_set.borrow_mut().as_mut() {
                 doc.set_attribute(node_id, &name, &value);
+                dirty_set.store(true, Ordering::Relaxed);
             }
             // Fire attributeChangedCallback for custom elements (gated by
             // observedAttributes inside the helper).
@@ -5661,6 +5812,7 @@ fn create_render_element_object(
     };
 
     let rd_rm = render_doc.clone();
+    let dirty_rm = dom_dirty.clone();
     let remove_attr_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let name = args
@@ -5670,6 +5822,7 @@ fn create_render_element_object(
                 .unwrap_or_default();
             if let Some(doc) = rd_rm.borrow_mut().as_mut() {
                 doc.remove_attribute(node_id, &name);
+                dirty_rm.store(true, Ordering::Relaxed);
             }
             Ok(JsValue::undefined())
         })
@@ -5677,6 +5830,7 @@ fn create_render_element_object(
 
     // ── appendChild / remove ──
     let rd_ac = render_doc.clone();
+    let dirty_ac = dom_dirty.clone();
     let append_child_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let child = args.first().cloned().unwrap_or(JsValue::undefined());
@@ -5745,6 +5899,7 @@ fn create_render_element_object(
                 }
                 appended = !insert_ids.is_empty();
                 if appended {
+                    dirty_ac.store(true, Ordering::Relaxed);
                     notify_mutation_observers(ctx, "childList", node_id as u32);
                 }
             }
@@ -5778,6 +5933,7 @@ fn create_render_element_object(
     };
 
     let rd_rem = render_doc.clone();
+    let dirty_rem = dom_dirty.clone();
     let remove_fn = unsafe {
         NativeFunction::from_closure(move |this: &JsValue, _args, ctx| {
             let removed = rd_rem
@@ -5790,6 +5946,7 @@ fn create_render_element_object(
             // Fire disconnectedCallback OUTSIDE the render-doc borrow (see
             // connectedCallback above).
             if removed {
+                dirty_rem.store(true, Ordering::Relaxed);
                 call_global_helper(ctx, "__oxi_fire_disconnected", std::slice::from_ref(this));
             }
             Ok(JsValue::undefined())
@@ -5798,9 +5955,11 @@ fn create_render_element_object(
 
     // ── style accessor (returns a CSSStyleDeclaration-like object) ──
     let rd_style = render_doc.clone();
+    let dirty_style_outer = dom_dirty.clone();
     let style_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
             let sp = rd_style.clone();
+            let dirty_style = dirty_style_outer.clone();
             let set_prop = NativeFunction::from_closure(move |_this, args, _ctx| {
                 let prop = args
                     .first()
@@ -5814,6 +5973,7 @@ fn create_render_element_object(
                     .unwrap_or_default();
                 if let Some(doc) = sp.borrow_mut().as_mut() {
                     doc.set_inline_style(node_id, &prop, &val);
+                    dirty_style.store(true, Ordering::Relaxed);
                 }
                 Ok(JsValue::undefined())
             });
@@ -5851,6 +6011,7 @@ fn create_render_element_object(
         .build();
 
     let rd_tc_set = render_doc.clone();
+    let dirty_tcs = dom_dirty.clone();
     let text_set_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let text = args
@@ -5860,6 +6021,7 @@ fn create_render_element_object(
                 .unwrap_or_default();
             if let Some(doc) = rd_tc_set.borrow_mut().as_mut() {
                 doc.set_text(node_id, &text);
+                dirty_tcs.store(true, Ordering::Relaxed);
             }
             Ok(JsValue::undefined())
         })
@@ -5884,6 +6046,7 @@ fn create_render_element_object(
         .name(js_string!("get id"))
         .build();
     let rd_id_set = render_doc.clone();
+    let dirty_ids = dom_dirty.clone();
     let id_set_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let v = args
@@ -5893,6 +6056,7 @@ fn create_render_element_object(
                 .unwrap_or_default();
             if let Some(doc) = rd_id_set.borrow_mut().as_mut() {
                 doc.set_attribute(node_id, "id", &v);
+                dirty_ids.store(true, Ordering::Relaxed);
             }
             Ok(JsValue::undefined())
         })
@@ -5916,6 +6080,7 @@ fn create_render_element_object(
         .name(js_string!("get className"))
         .build();
     let rd_cls_set = render_doc.clone();
+    let dirty_cls = dom_dirty.clone();
     let cls_set_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let v = args
@@ -5925,6 +6090,7 @@ fn create_render_element_object(
                 .unwrap_or_default();
             if let Some(doc) = rd_cls_set.borrow_mut().as_mut() {
                 doc.set_attribute(node_id, "class", &v);
+                dirty_cls.store(true, Ordering::Relaxed);
             }
             Ok(JsValue::undefined())
         })
@@ -5933,9 +6099,13 @@ fn create_render_element_object(
         .name(js_string!("set className"))
         .build();
 
+    let dirty_click = dom_dirty.clone();
     let click_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
             // Fire any registered click listeners directly (no mutation log).
+            // Listeners commonly mutate the DOM; mark dirty up front so a
+            // click always costs a screencast frame when it changes anything.
+            dirty_click.store(true, Ordering::Relaxed);
             for cb in registry_get(node_id as u32, "click") {
                 let evt = boa_engine::object::ObjectInitializer::new(ctx)
                     .property(
@@ -6035,6 +6205,7 @@ fn create_render_element_object(
         .name(js_string!("get value"))
         .build();
     let rd_val_set = render_doc.clone();
+    let dirty_vs = dom_dirty.clone();
     let val_set_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let v = args
@@ -6044,6 +6215,7 @@ fn create_render_element_object(
                 .unwrap_or_default();
             if let Some(doc) = rd_val_set.borrow_mut().as_mut() {
                 doc.set_attribute(node_id, "value", &v);
+                dirty_vs.store(true, Ordering::Relaxed);
             }
             Ok(JsValue::undefined())
         })
@@ -6066,17 +6238,19 @@ fn create_render_element_object(
     // tree, then reads the slot-assignment registry. Returns [] for non-slot
     // nodes (a harmless no-op on ordinary elements).
     let an_rd = render_doc.clone();
+    let an_dirty = dom_dirty.clone();
     let assigned_nodes_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
             let assigned = refresh_slot_assignments(&an_rd, node_id);
             let objs: Vec<JsValue> = assigned
                 .into_iter()
-                .map(|cid| create_render_element_object(ctx, an_rd.clone(), cid as usize))
+                .map(|cid| create_render_element_object(ctx, an_rd.clone(), cid as usize, an_dirty.clone()))
                 .collect();
             Ok(JsArray::from_iter(objs, ctx).into())
         })
     };
     let ae_rd = render_doc.clone();
+    let ae_dirty = dom_dirty.clone();
     let assigned_elements_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
             let assigned = refresh_slot_assignments(&ae_rd, node_id);
@@ -6089,7 +6263,7 @@ fn create_render_element_object(
                         .and_then(|d| d.tag_name(*cid as usize))
                         .is_some()
                 })
-                .map(|cid| create_render_element_object(ctx, ae_rd.clone(), cid as usize))
+                .map(|cid| create_render_element_object(ctx, ae_rd.clone(), cid as usize, ae_dirty.clone()))
                 .collect();
             Ok(JsArray::from_iter(objs, ctx).into())
         })
@@ -6097,6 +6271,7 @@ fn create_render_element_object(
     // node.assignedSlot: the <slot> this node was distributed into (open trees
     // only; slots in closed roots yield null), or null.
     let as_rd = render_doc.clone();
+    let as_dirty = dom_dirty.clone();
     let assigned_slot_get_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
             {
@@ -6110,6 +6285,7 @@ fn create_render_element_object(
                     ctx,
                     as_rd.clone(),
                     slot_id as usize,
+                    as_dirty.clone(),
                 )),
                 None => Ok(JsValue::null()),
             }
@@ -6157,43 +6333,43 @@ fn create_render_element_object(
             js_string!("style"),
             Some(style_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("textContent"),
             Some(text_getter_fn),
             Some(text_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("id"),
             Some(id_getter_fn),
             Some(id_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("className"),
             Some(cls_getter_fn),
             Some(cls_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("value"),
             Some(val_getter_fn),
             Some(val_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("href"),
             Some(href_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("src"),
             Some(src_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .function(assigned_nodes_fn, js_string!("assignedNodes"), 0)
         .function(assigned_elements_fn, js_string!("assignedElements"), 0)
@@ -6201,7 +6377,7 @@ fn create_render_element_object(
             js_string!("assignedSlot"),
             Some(assigned_slot_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .build();
     JsValue::from(obj)
@@ -6212,6 +6388,7 @@ fn register_document_object(
     ctx: &mut Context,
     dom_snapshot: &Arc<RwLock<Option<DomSnapshot>>>,
     mutations: &Arc<RwLock<Vec<DomMutation>>>,
+    dom_dirty: &Arc<AtomicBool>,
     cookie_jar_arc: &Arc<RwLock<Option<Arc<RwLock<CookieJar>>>>>,
     render_doc_rc: &Rc<RefCell<Option<RenderDocument>>>,
 ) {
@@ -6293,6 +6470,7 @@ fn register_document_object(
     let dom_capture_qs = dom_snapshot.clone();
     let mutations_capture_qs = mutations.clone();
     let rd_qs = render_doc_rc.clone();
+    let dirty_qs = dom_dirty.clone();
     let query_selector_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let selector = args
@@ -6307,7 +6485,7 @@ fn register_document_object(
                 guard.as_ref().and_then(|doc| doc.query_selector(&selector))
             };
             if let Some(nid) = nid_opt {
-                return Ok(create_render_element_object(ctx, rd_qs.clone(), nid));
+                return Ok(create_render_element_object(ctx, rd_qs.clone(), nid, dirty_qs.clone()));
             }
 
             let dom = dom_capture_qs.read();
@@ -6331,6 +6509,7 @@ fn register_document_object(
     let dom_capture_qsa = dom_snapshot.clone();
     let mutations_capture_qsa = mutations.clone();
     let rd_qsa = render_doc_rc.clone();
+    let dirty_qsa = dom_dirty.clone();
     let query_selector_all_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let selector = args
@@ -6350,7 +6529,7 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_qsa.clone(), nid))
+                    .map(|nid| create_render_element_object(ctx, rd_qsa.clone(), nid, dirty_qsa.clone()))
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6385,6 +6564,7 @@ fn register_document_object(
     let dom_capture_gbi = dom_snapshot.clone();
     let mutations_capture_gbi = mutations.clone();
     let rd_gbi = render_doc_rc.clone();
+    let dirty_gbi = dom_dirty.clone();
     let get_element_by_id_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let id = args
@@ -6401,7 +6581,7 @@ fn register_document_object(
                     .and_then(|doc| doc.query_selector(&format!("#{id}")))
             };
             if let Some(nid) = nid_opt {
-                return Ok(create_render_element_object(ctx, rd_gbi.clone(), nid));
+                return Ok(create_render_element_object(ctx, rd_gbi.clone(), nid, dirty_gbi.clone()));
             }
 
             let dom = dom_capture_gbi.read();
@@ -6425,6 +6605,7 @@ fn register_document_object(
     let dom_capture_gtn = dom_snapshot.clone();
     let mutations_capture_gtn = mutations.clone();
     let rd_gtn = render_doc_rc.clone();
+    let dirty_gtn = dom_dirty.clone();
     let get_elements_by_tag_name_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let tag = args
@@ -6444,7 +6625,7 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_gtn.clone(), nid))
+                    .map(|nid| create_render_element_object(ctx, rd_gtn.clone(), nid, dirty_gtn.clone()))
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6479,6 +6660,7 @@ fn register_document_object(
     let dom_capture_gcn = dom_snapshot.clone();
     let mutations_capture_gcn = mutations.clone();
     let rd_gcn = render_doc_rc.clone();
+    let dirty_gcn = dom_dirty.clone();
     let get_elements_by_class_name_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let class = args
@@ -6498,7 +6680,7 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_gcn.clone(), nid))
+                    .map(|nid| create_render_element_object(ctx, rd_gcn.clone(), nid, dirty_gcn.clone()))
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6652,6 +6834,7 @@ fn register_document_object(
 
     // document.body / document.head / document.documentElement getters
     let rd_body = render_doc_rc.clone();
+    let dirty_body = dom_dirty.clone();
     let dom_snap_body = dom_snapshot.clone();
     let dom_snap_body_clone = dom_snapshot.clone();
     let body_getter_fn = {
@@ -6664,7 +6847,7 @@ fn register_document_object(
                     guard.as_ref().and_then(|doc| doc.query_selector("body"))
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_body.clone(), nid));
+                    return Ok(create_render_element_object(ctx, rd_body.clone(), nid, dirty_body.clone()));
                 }
 
                 let snap = dom_snap_body.read();
@@ -6689,6 +6872,7 @@ fn register_document_object(
     };
 
     let rd_head = render_doc_rc.clone();
+    let dirty_head = dom_dirty.clone();
     let dom_snap_head = dom_snapshot.clone();
     let dom_snap_head_clone = dom_snapshot.clone();
     let head_getter_fn = {
@@ -6701,7 +6885,7 @@ fn register_document_object(
                     guard.as_ref().and_then(|doc| doc.query_selector("head"))
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_head.clone(), nid));
+                    return Ok(create_render_element_object(ctx, rd_head.clone(), nid, dirty_head.clone()));
                 }
 
                 let snap = dom_snap_head.read();
@@ -6726,6 +6910,7 @@ fn register_document_object(
     };
 
     let rd_de = render_doc_rc.clone();
+    let dirty_de = dom_dirty.clone();
     let dom_snap_de = dom_snapshot.clone();
     let document_element_getter_fn = {
         let mutations_clone = mutations.clone();
@@ -6737,7 +6922,7 @@ fn register_document_object(
                     guard.as_ref().map(|doc| doc.root_element_id())
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_de.clone(), nid));
+                    return Ok(create_render_element_object(ctx, rd_de.clone(), nid, dirty_de.clone()));
                 }
 
                 let snap = dom_snap_de.read();
@@ -6832,6 +7017,7 @@ fn register_document_object(
     let dom_snap_ce = dom_snapshot.clone();
     let mutations_ce = mutations.clone();
     let rd_ce = render_doc_rc.clone();
+    let dirty_ce = dom_dirty.clone();
     let create_element_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let tag = args
@@ -6851,7 +7037,7 @@ fn register_document_object(
             };
             if let Some(nid) = nid_opt {
                 return Ok(upgrade_custom_element(
-                    create_render_element_object(ctx, rd_ce.clone(), nid),
+                    create_render_element_object(ctx, rd_ce.clone(), nid, dirty_ce.clone()),
                     ctx,
                 ));
             }
@@ -7133,19 +7319,19 @@ fn register_document_object(
             js_string!("title"),
             Some(title_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("URL"),
             Some(url_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("cookie"),
             Some(cookie_getter_fn),
             Some(cookie_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .function(query_selector_fn, js_string!("querySelector"), 1)
         .function(query_selector_all_fn, js_string!("querySelectorAll"), 1)
@@ -7175,26 +7361,26 @@ fn register_document_object(
             js_string!("body"),
             Some(body_getter_fn.clone()),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("head"),
             Some(head_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("documentElement"),
             Some(document_element_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         // activeElement — same as body (no real focus tracking yet)
         .accessor(
             js_string!("activeElement"),
             Some(body_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         // elementFromPoint(x, y) — returns element at viewport coordinates.
         // Approximation: finds the Nth visible element by DOM order.
@@ -7253,7 +7439,7 @@ fn register_document_object(
             js_string!("readyState"),
             Some(ready_state_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .build();
 
@@ -8795,37 +8981,37 @@ fn create_element_object(
             js_string!("textContent"),
             Some(text_content_getter_fn.clone()),
             Some(text_content_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("innerText"),
             Some(text_content_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("innerHTML"),
             Some(inner_html_getter_fn),
             Some(inner_html_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("outerHTML"),
             Some(outer_html_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("id"),
             Some(id_getter_fn),
             Some(id_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("className"),
             Some(class_getter_fn),
             Some(class_setter_fn),
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .property(
             js_string!("href"),
@@ -8840,9 +9026,16 @@ fn create_element_object(
         .property(
             js_string!("children"),
             JsValue::from(children_arr),
-            Attribute::all(),
+            // Non-enumerable: children/parentNode form reference cycles with
+            // child elements, and enumerable data props are walked by
+            // JSON.stringify (js_value_to_json) — unbounded recursion.
+            Attribute::CONFIGURABLE,
         )
-        .property(js_string!("parentNode"), parent_val, Attribute::all())
+        .property(
+            js_string!("parentNode"),
+            parent_val,
+            Attribute::CONFIGURABLE,
+        )
         .function(get_attribute_fn, js_string!("getAttribute"), 1)
         .function(has_attribute_fn, js_string!("hasAttribute"), 1)
         .function(add_event_listener_fn, js_string!("addEventListener"), 2)
@@ -8895,25 +9088,25 @@ fn create_element_object(
             js_string!("firstChild"),
             Some(first_child_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("lastChild"),
             Some(last_child_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("nextSibling"),
             Some(next_sibling_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("previousSibling"),
             Some(prev_sibling_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         // ── 트리 조작 메서드 ──
         .function(insert_before_fn, js_string!("insertBefore"), 2)
@@ -8927,13 +9120,13 @@ fn create_element_object(
             js_string!("style"),
             Some(style_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("classList"),
             Some(classlist_getter_fn),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         // ── 레이아웃 평가 ──
         .function(
@@ -8945,13 +9138,13 @@ fn create_element_object(
             js_string!("offsetWidth"),
             Some(offset_width_getter),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("offsetHeight"),
             Some(offset_height_getter),
             None,
-            Attribute::all(),
+            Attribute::CONFIGURABLE,
         )
         // ── _visible / _interactive — methods that read live from DomSnapshot ──
         .function(
@@ -10006,6 +10199,235 @@ fn register_window_globals(
         stealth.webgl2.clone(),
         Attribute::all(),
     );
+
+    // --- DOMParser ---
+    //
+    // `new DOMParser().parseFromString(html, mime)` → a detached Document-like
+    // object backed by its own DomSnapshot, parsed through the same Blitz
+    // pipeline as `set_inner_html` (`parse_html_fragment_to_snapshot`) and
+    // surfacing the same element objects as the live document
+    // (`create_element_object`). Only `text/html` is accepted; any other MIME
+    // type throws TypeError. `parseFromString` is stateless — every call owns
+    // its freshly parsed DomSnapshot, so one native implementation is shared
+    // by all DOMParser instances.
+    let parse_from_string_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            let html = args
+                .first()
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let mime = args
+                .get(1)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            if !mime.eq_ignore_ascii_case("text/html") {
+                return Err(boa_engine::JsNativeError::typ()
+                    .with_message(format!(
+                        "Failed to execute 'parseFromString' on 'DOMParser': the provided MIME type '{mime}' is not supported"
+                    ))
+                    .into());
+            }
+
+            let parsed = crate::js::dom_snapshot::parse_html_fragment_to_snapshot(&html);
+            let parsed_arc: Arc<RwLock<Option<DomSnapshot>>> = Arc::new(RwLock::new(Some(parsed)));
+            let parsed_muts: Arc<RwLock<Vec<DomMutation>>> = Arc::new(RwLock::new(Vec::new()));
+
+            // body / head / documentElement getters — same shape as the live
+            // document's, minus the render-document fast path (a parsed doc
+            // has no RenderDocument).
+            let body_snap = parsed_arc.clone();
+            let body_muts = parsed_muts.clone();
+            let body_getter_fn = FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_closure(move |_this, _args, ctx| {
+                    let snap = body_snap.read();
+                    if let Some(s) = snap.as_ref()
+                        && let Some(bid) = s.body_id
+                        && let Some(node) = s.nodes.get(&bid)
+                    {
+                        return Ok(create_element_object(s, node, ctx, &body_muts, &body_snap));
+                    }
+                    Ok(JsValue::null())
+                }),
+            )
+            .name(js_string!("get body"))
+            .build();
+
+            let head_snap = parsed_arc.clone();
+            let head_muts = parsed_muts.clone();
+            let head_getter_fn = FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_closure(move |_this, _args, ctx| {
+                    let snap = head_snap.read();
+                    if let Some(s) = snap.as_ref()
+                        && let Some(hid) = s.head_id
+                        && let Some(node) = s.nodes.get(&hid)
+                    {
+                        return Ok(create_element_object(s, node, ctx, &head_muts, &head_snap));
+                    }
+                    Ok(JsValue::null())
+                }),
+            )
+            .name(js_string!("get head"))
+            .build();
+
+            let de_snap = parsed_arc.clone();
+            let de_muts = parsed_muts.clone();
+            let de_getter_fn = FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_closure(move |_this, _args, ctx| {
+                    let snap = de_snap.read();
+                    if let Some(s) = snap.as_ref() {
+                        // documentElement is the <html> child of the root
+                        // Document node (same walk as the live document).
+                        let html_node = s.nodes.get(&s.root_id).and_then(|root| {
+                            root.children.iter().find_map(|&child_id| {
+                                s.nodes
+                                    .get(&child_id)
+                                    .and_then(|n| if n.tag == "html" { Some((child_id, n)) } else { None })
+                            })
+                        });
+                        if let Some((_, node)) = html_node {
+                            return Ok(create_element_object(s, node, ctx, &de_muts, &de_snap));
+                        }
+                    }
+                    Ok(JsValue::null())
+                }),
+            )
+            .name(js_string!("get documentElement"))
+            .build();
+
+            // getElementById(id)
+            let gbi_snap = parsed_arc.clone();
+            let gbi_muts = parsed_muts.clone();
+            let get_element_by_id_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let snap = gbi_snap.read();
+                if let Some(s) = snap.as_ref()
+                    && let Some(node_id) = s.get_element_by_id(&id)
+                    && let Some(node) = s.nodes.get(&node_id)
+                {
+                    return Ok(create_element_object(s, node, ctx, &gbi_muts, &gbi_snap));
+                }
+                Ok(JsValue::null())
+            });
+
+            // querySelector(selector)
+            let qs_snap = parsed_arc.clone();
+            let qs_muts = parsed_muts.clone();
+            let query_selector_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let selector = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let snap = qs_snap.read();
+                if let Some(s) = snap.as_ref()
+                    && let Some(node_id) = s.query_selector(&selector)
+                    && let Some(node) = s.nodes.get(&node_id)
+                {
+                    return Ok(create_element_object(s, node, ctx, &qs_muts, &qs_snap));
+                }
+                Ok(JsValue::null())
+            });
+
+            // querySelectorAll(selector)
+            let qsa_snap = parsed_arc.clone();
+            let qsa_muts = parsed_muts.clone();
+            let query_selector_all_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let selector = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let snap = qsa_snap.read();
+                let js_values: Vec<JsValue> = match snap.as_ref() {
+                    Some(s) => s
+                        .query_selector_all(&selector)
+                        .iter()
+                        .filter_map(|&id| {
+                            s.nodes.get(&id).map(|node| {
+                                create_element_object(s, node, ctx, &qsa_muts, &qsa_snap)
+                            })
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let arr = JsArray::from_iter(js_values, ctx);
+                Ok(arr.into())
+            });
+
+            // Accessors are non-enumerable: eval results are serialized via
+            // JSON.stringify (js_value_to_json), and enumerable accessors
+            // would fire the getters, walking element objects whose
+            // firstChild/nextSibling accessors recurse without termination.
+            let doc_obj = boa_engine::object::ObjectInitializer::new(ctx)
+                .accessor(
+                    js_string!("documentElement"),
+                    Some(de_getter_fn),
+                    None,
+                    Attribute::CONFIGURABLE,
+                )
+                .accessor(
+                    js_string!("head"),
+                    Some(head_getter_fn),
+                    None,
+                    Attribute::CONFIGURABLE,
+                )
+                .accessor(
+                    js_string!("body"),
+                    Some(body_getter_fn),
+                    None,
+                    Attribute::CONFIGURABLE,
+                )
+                .function(get_element_by_id_fn, js_string!("getElementById"), 1)
+                .function(query_selector_fn, js_string!("querySelector"), 1)
+                .function(query_selector_all_fn, js_string!("querySelectorAll"), 1)
+                .build();
+            Ok(JsValue::from(doc_obj))
+        })
+    };
+
+    // DOMParser constructor: `new DOMParser()` (or a plain call) yields an
+    // object exposing `parseFromString`.
+    let dom_parser_ctor = unsafe {
+        let parse_fn = parse_from_string_fn.clone();
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            let parse_fn = parse_fn.clone();
+            let obj = boa_engine::object::ObjectInitializer::new(ctx)
+                .function(parse_fn, js_string!("parseFromString"), 2)
+                .build();
+            Ok(JsValue::from(obj))
+        })
+    };
+    let _ = ctx.register_global_callable(js_string!("DOMParser"), 0, dom_parser_ctor);
+
+    // Mirror idle-callback helpers + DOMParser onto `window`. globalThis and
+    // window are distinct objects here, so feature-detection reads like
+    // `'DOMParser' in window` / `window.requestIdleCallback` need explicit
+    // copies. register_window_globals re-runs per navigation (window is
+    // rebuilt each time); on context creation the idle helpers are registered
+    // after this point, so the setup fn mirrors them too — each lookup simply
+    // skips a not-yet-registered global.
+    {
+        let globals = ctx.global_object().clone();
+        if let Ok(win_val) = globals.get(js_string!("window"), ctx)
+            && let Some(win_obj) = win_val.as_object()
+        {
+            for name in ["requestIdleCallback", "cancelIdleCallback", "DOMParser"] {
+                if let Ok(v) = globals.get(JsString::from(name), ctx) {
+                    let _ = win_obj.set(JsString::from(name), v, true, ctx);
+                }
+            }
+        }
+    }
+
     // ── SPA routing: history + location navigation ──
     // Native triggers push `DomMutation::Navigate`/`Reload`, which `Session`
     // drains and executes as real (async) navigations. The `history`/`location`
@@ -10576,11 +10998,50 @@ fn register_window_globals(
       }
     });
   }
-  // structuredClone: deep-clone plain data via JSON.
+  // structuredClone: deep-clone plain objects, arrays, Date, RegExp, Map,
+  // Set and primitives (cycle-safe via WeakMap). Functions are not
+  // cloneable — throws with name 'DataCloneError', matching the spec.
   def(globalThis, 'structuredClone', function (v) {
-    if (v === null || typeof v !== 'object') return v;
-    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
+    function cloneErr() {
+      var e = new Error('function could not be cloned.');
+      e.name = 'DataCloneError';
+      return e;
+    }
+    var seen = new WeakMap();
+    function clone(x) {
+      if (x === null || typeof x !== 'object') {
+        if (typeof x === 'function') throw cloneErr();
+        return x;
+      }
+      if (seen.has(x)) return seen.get(x);
+      if (x instanceof Date) return new Date(x.getTime());
+      if (x instanceof RegExp) return new RegExp(x.source, x.flags);
+      if (x instanceof Map) {
+        var m = new Map();
+        seen.set(x, m);
+        x.forEach(function (mv, mk) { m.set(clone(mk), clone(mv)); });
+        return m;
+      }
+      if (x instanceof Set) {
+        var s = new Set();
+        seen.set(x, s);
+        x.forEach(function (item) { s.add(clone(item)); });
+        return s;
+      }
+      var out = Array.isArray(x) ? [] : {};
+      seen.set(x, out);
+      if (Array.isArray(x)) {
+        for (var i = 0; i < x.length; i++) out[i] = clone(x[i]);
+      } else {
+        for (var k in x) {
+          if (Object.prototype.hasOwnProperty.call(x, k)) out[k] = clone(x[k]);
+        }
+      }
+      return out;
+    }
+    return clone(v);
   });
+  if (globalThis.window) globalThis.window.structuredClone = globalThis.structuredClone;
   // queueMicrotask: schedule on the microtask queue via Promise.
   def(globalThis, 'queueMicrotask', function (cb) { Promise.resolve().then(cb); });
   // FinalizationRegistry presence stub (WeakRef is already present in boa).
@@ -11485,7 +11946,13 @@ mod tests {
                    small: window.matchMedia('(min-width: 100px)').matches,\
                    huge: window.matchMedia('(min-width: 99999px)').matches,\
                    maxok: window.matchMedia('(max-width: 5000px)').matches,\
-                   dark: window.matchMedia('(prefers-color-scheme: dark)').matches\
+                   dark: window.matchMedia('(prefers-color-scheme: dark)').matches,\
+                   media: window.matchMedia('(min-width: 100px)').media,\
+                   onchangeNull: window.matchMedia('(min-width: 100px)').onchange === null,\
+                   listeners: ['addListener', 'removeListener', 'addEventListener',\
+                     'removeEventListener'].every(function (k) {\
+                       return typeof window.matchMedia('(min-width: 1px)')[k] === 'function';\
+                     })\
                  })",
             )
             .await
@@ -11506,6 +11973,21 @@ mod tests {
             obj["dark"],
             serde_json::json!(false),
             "non-width query defaults to false"
+        );
+        assert_eq!(
+            obj["media"],
+            serde_json::json!("(min-width: 100px)"),
+            "media echoes the query string"
+        );
+        assert_eq!(
+            obj["onchangeNull"],
+            serde_json::json!(true),
+            "onchange defaults to null"
+        );
+        assert_eq!(
+            obj["listeners"],
+            serde_json::json!(true),
+            "MQL exposes add/remove listener methods"
         );
     }
 
@@ -12659,6 +13141,250 @@ mod tests {
         let result = rt.evaluate("c").await.unwrap();
         assert!(result.is_ok());
         assert_eq!(result.value, Some(Value::Number(0.into())));
+    }
+
+    #[tokio::test]
+    async fn test_request_idle_callback_fires() {
+        let mut rt = JsRuntime::new();
+        // requestIdleCallback schedules through the timer machinery; the
+        // callback fires on the next drain with an IdleDeadline object.
+        rt.evaluate(
+            "let x = 0; requestIdleCallback(function (d) {\
+               if (d && d.didTimeout === false && d.timeRemaining() === 0) x = 7;\
+             })",
+        )
+        .await
+        .unwrap();
+        let result = rt.evaluate("x").await.unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::Number(7.into())));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_idle_callback_cancels_timer() {
+        let mut rt = JsRuntime::new();
+        rt.evaluate(
+            "let x = 0; let id = requestIdleCallback(function () { x = 1; }); cancelIdleCallback(id)",
+        )
+        .await
+        .unwrap();
+        let result = rt.evaluate("x").await.unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::Number(0.into())));
+    }
+
+    #[tokio::test]
+    async fn test_request_idle_callback_on_window() {
+        let mut rt = JsRuntime::new();
+        // window/globalThis are distinct objects; both must expose the API.
+        let result = rt
+            .evaluate(
+                "typeof window.requestIdleCallback === 'function' && \
+                 typeof window.cancelIdleCallback === 'function' && \
+                 typeof requestIdleCallback === 'function'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(Value::Bool(true)));
+    }
+
+    // Regression: `Infinity as u64` saturated to u64::MAX and
+    // `Instant::now() + Duration::from_millis(u64::MAX)` overflowed, panicking
+    // inside the native closure (contained by catch_unwind, but the eval
+    // failed). Clamped delays must schedule cleanly.
+    #[tokio::test]
+    async fn test_clamped_timer_delays_schedule_without_panic() {
+        let mut rt = JsRuntime::new();
+        let ric = rt
+            .evaluate(
+                "requestIdleCallback(function () {}, { timeout: Infinity })",
+            )
+            .await
+            .expect("requestIdleCallback with Infinity timeout must not panic");
+        assert!(
+            matches!(ric.value, Some(Value::Number(_))),
+            "requestIdleCallback must return a numeric handle, got {:?}",
+            ric.value
+        );
+
+        let st = rt
+            .evaluate("setTimeout(function () {}, Infinity)")
+            .await
+            .expect("setTimeout with Infinity delay must not panic");
+        assert!(matches!(st.value, Some(Value::Number(_))));
+
+        // Huge finite delay (1e18 ms): finite values also clamp.
+        let st2 = rt
+            .evaluate("setTimeout(function () {}, 1e18)")
+            .await
+            .expect("setTimeout with 1e18 delay must not panic");
+        assert!(matches!(st2.value, Some(Value::Number(_))));
+
+        // Negative / NaN delays clamp to 0 instead of panicking on cast.
+        let st3 = rt
+            .evaluate("setTimeout(function () {}, -5); setTimeout(function () {}, NaN)")
+            .await
+            .expect("negative/NaN delays must not panic");
+        assert!(matches!(st3.value, Some(Value::Number(_))));
+    }
+
+    #[tokio::test]
+    async fn test_normal_timer_delays_still_fire() {
+        let mut rt = JsRuntime::new();
+        // Normal finite delays are unaffected by the clamp and still fire on
+        // the next drain; the Infinity-clamped callback must NOT fire.
+        rt.evaluate(
+            "let x = 0; setTimeout(function () { x = 7; }, 0); \
+             requestIdleCallback(function () { x = 99; }, { timeout: Infinity })",
+        )
+        .await
+        .unwrap();
+        let result = rt.evaluate("x").await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(7)));
+    }
+
+    // Regression: render-element bindings mutate the RenderDocument directly
+    // (no DomMutation journal), so screencast generation was never bumped for
+    // them. The shared dom_dirty flag must catch these.
+    #[tokio::test]
+    async fn test_dom_dirty_flag_on_render_element_bindings() {
+        let mut rt = JsRuntime::new();
+        rt.set_document(
+            "<!DOCTYPE html><html><body><p id=\"p\">hi</p></body></html>",
+            Some("https://example.com/"),
+            (400, 300),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !rt.take_dom_dirty(),
+            "flag must start false with no eval after set_document"
+        );
+
+        // Attribute + event bindings on a live render element (query the
+        // intact document first: body.textContent below replaces children).
+        rt.evaluate(
+            "document.getElementById('p').setAttribute('data-k', 'v')",
+        )
+        .await
+        .unwrap();
+        assert!(rt.take_dom_dirty(), "setAttribute must mark dirty");
+
+        rt.evaluate("document.getElementById('p').click()")
+            .await
+            .unwrap();
+        assert!(rt.take_dom_dirty(), "click must mark dirty");
+        assert!(!rt.take_dom_dirty(), "take_dom_dirty must reset the flag");
+
+        // textContent setter mutates the doc directly.
+        rt.evaluate("document.body.textContent = 'x'").await.unwrap();
+        assert!(rt.take_dom_dirty(), "textContent setter must mark dirty");
+        assert!(!rt.take_dom_dirty(), "flag must be clear after take");
+    }
+
+    #[tokio::test]
+    async fn test_dom_parser_parses_and_queries() {
+        let mut rt = JsRuntime::new();
+        rt.evaluate(
+            r#"globalThis.__doc = new DOMParser().parseFromString(
+                 '<html><head><title>t</title></head>\
+                  <body><div id="main"><p class="k">one</p><p>two</p></div></body></html>',
+                 'text/html')"#,
+        )
+        .await
+        .unwrap();
+
+        // documentElement / head / body resolve to elements.
+        let result = rt
+            .evaluate(
+                "[__doc.documentElement.tagName, __doc.head.tagName, __doc.body.tagName].join(',')",
+            )
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::String("HTML,HEAD,BODY".into())));
+
+        // getElementById via the parsed snapshot.
+        let result = rt
+            .evaluate("__doc.getElementById('main').getAttribute('id')")
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::String("main".into())));
+
+        // querySelector / querySelectorAll over the parsed tree.
+        let result = rt
+            .evaluate("__doc.querySelector('.k').textContent")
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::String("one".into())));
+
+        let result = rt
+            .evaluate("__doc.querySelectorAll('p').length")
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::Number(2.into())));
+
+        // Non-matching selector → null, empty list.
+        let result = rt
+            .evaluate(
+                "[String(__doc.querySelector('.nope')), __doc.querySelectorAll('.nope').length].join(',')",
+            )
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::String("null,0".into())));
+
+        // Registered on window as well as globalThis.
+        let result = rt
+            .evaluate("typeof window.DOMParser === 'function'")
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn test_dom_parser_rejects_non_html_mime() {
+        let mut rt = JsRuntime::new();
+        let result = rt
+            .evaluate(
+                "(function () {\
+                   try { new DOMParser().parseFromString('<a/>', 'application/xml'); return 'no-throw'; }\
+                   catch (e) { return e.name + ':' + (e instanceof TypeError); }\
+                 })()",
+            )
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            result.value,
+            Some(Value::String("TypeError:true".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dom_parser_detached_from_main_document() {
+        // A parsed document must not leak into the live DomSnapshot.
+        let mut rt = JsRuntime::new();
+        rt.set_document("<html><body></body></html>", None, (1280, 720))
+            .await
+            .unwrap();
+        rt.evaluate(
+            r#"new DOMParser().parseFromString(
+                 '<html><body><div id="leak">x</div></body></html>', 'text/html')"#,
+        )
+        .await
+        .unwrap();
+        let result = rt
+            .evaluate(
+                "document.getElementById('leak') == null && document.querySelectorAll('div').length === 0",
+            )
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.value, Some(Value::Bool(true)));
     }
 
     #[tokio::test]
@@ -13883,6 +14609,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_eval_result_element_object_serializes() {
+        let mut rt = JsRuntime::new();
+        let html = r#"<html><body><p id="a">x</p><p id="b">y</p></body></html>"#;
+        let frame = make_frame(html).await;
+        let snapshot = DomSnapshot::from_frame(&frame);
+        rt.set_dom_snapshot(Some(snapshot));
+
+        // Regression: element objects exposed enumerable tree accessors
+        // (firstChild/nextSibling) and enumerable reference-cycling data props
+        // (children/parentNode). JSON.stringify inside js_value_to_json walked
+        // them without termination and overflowed the JS thread stack. A live
+        // element as the final eval result must serialize, not crash.
+        let result = rt
+            .evaluate("document.getElementById('a')")
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert!(result.value.is_some());
+    }
+
+    #[tokio::test]
     async fn test_mutation_click() {
         let mut rt = JsRuntime::new();
         let html = r#"<html><body><button id="btn">Click</button></body></html>"#;
@@ -14136,6 +14883,57 @@ mod tests {
             "Intl and FinalizationRegistry must be detectable on window"
         );
     }
+
+    #[tokio::test]
+    async fn test_structured_clone_deep_copies_typed_values() {
+        // structuredClone must preserve Date, RegExp, Map, Set and nested
+        // structures by value (no shared state), and reject functions with
+        // DataCloneError.
+        let mut rt = JsRuntime::new();
+        rt.set_page_url("https://example.com/");
+        let r = rt
+            .evaluate(
+                "(function () {\
+                   var src = {\
+                     nested: { arr: [1, [2, 3]] },\
+                     when: new Date(1234567890123),\
+                     re: /ab/gi,\
+                     m: new Map([['a', 1]]),\
+                     s: new Set(['x'])\
+                   };\
+                   var c = structuredClone(src);\
+                   src.nested.arr[1][0] = 42;\
+                   src.m.set('a', 99);\
+                   var errName = '';\
+                   try { structuredClone(function () {}); } catch (e) { errName = e.name; }\
+                   return ({\
+                     deep: c.nested.arr[1][0],\
+                     date: c.when instanceof Date && c.when.getTime() === 1234567890123,\
+                     re: c.re instanceof RegExp && c.re.source === 'ab' && c.re.flags.indexOf('g') >= 0,\
+                     map: c.m instanceof Map && c.m.get('a') === 1,\
+                     set: c.s instanceof Set && c.s.has('x'),\
+                     err: errName\
+                   });\
+                 })()",
+            )
+            .await
+            .expect("evaluate");
+        if r.value.is_none() {
+            panic!("structuredClone eval failed: {:?}", r.exception);
+        }
+        let obj = r.value.expect("json object");
+        assert_eq!(obj["deep"], serde_json::json!(2), "nested array deep-cloned");
+        assert_eq!(obj["date"], serde_json::json!(true), "Date cloned by value");
+        assert_eq!(obj["re"], serde_json::json!(true), "RegExp cloned with flags");
+        assert_eq!(obj["map"], serde_json::json!(true), "Map cloned by value");
+        assert_eq!(obj["set"], serde_json::json!(true), "Set cloned by value");
+        assert_eq!(
+            obj["err"],
+            serde_json::json!("DataCloneError"),
+            "functions throw DataCloneError"
+        );
+    }
+
     #[tokio::test]
     async fn test_custom_elements_registry_and_shadow_dom() {
         let mut rt = JsRuntime::new();

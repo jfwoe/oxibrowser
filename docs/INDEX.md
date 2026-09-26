@@ -21,7 +21,7 @@ Archived (out of root, kept for history): 9 in `archive/`, 4 in `archive/transie
 - **`ARCHITECTURE.md`** — Module layout, lifecycle, threading model, integration points.
 - **`CDP.md`** — Chrome DevTools Protocol surface supported by OxiBrowser, mappings, and quirks.
 - **`QUICKSTART.md`** — First-run, embedding, and example agent usage.
-- **`roadmap-v0.5.md`** — v0.5 milestone plan; later milestones have moved to the dated designs in `designs/`.
+- **`roadmap.md`** — living roadmap: current state, prioritized next work, non-goals. Historical milestone plans are in git history; dated designs live in `designs/`.
 - **`search-command-proposal.md`** — Proposal for a search-driven CLI surface.
 - **`design-agent-layout-eval.md`** — Layout evaluation notes produced during agent-mode design passes.
 

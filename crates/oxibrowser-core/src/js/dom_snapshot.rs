@@ -1796,6 +1796,254 @@ pub(crate) fn parse_html_fragment_to_snapshot(html: &str) -> DomSnapshot {
     DomSnapshot::from_render_document(&rd, "", "")
 }
 
+// ── Interactive element discovery (for OXI.getInteractiveElements) ──────────
+
+/// Visible text is capped at this many chars per interactive element.
+const MAX_INTERACTIVE_TEXT_CHARS: usize = 80;
+
+/// One interactive element found by [`DomSnapshot::interactive_elements`].
+///
+/// Serialized shape matches the `OXI.getInteractiveElements` wire format
+/// (camelCase). Geometry (`box`) is intentionally absent: `DomNode` carries no
+/// layout rectangles and computing them requires a layout pass, so the field is
+/// omitted from the wire format rather than reported as null.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InteractiveElement {
+    /// Internal node id. Not part of the wire format.
+    #[serde(skip)]
+    pub node_id: u32,
+    /// 0-based position across all interactive elements, in document order.
+    pub index: usize,
+    /// Lowercased tag name.
+    pub tag: String,
+    /// Computed role: explicit `role` attribute, else implicit per tag/type.
+    pub role: String,
+    /// Visible (descendant) text, whitespace-trimmed and capped at
+    /// [`MAX_INTERACTIVE_TEXT_CHARS`].
+    pub text: String,
+    /// `href` attribute, when present and non-empty.
+    pub href: Option<String>,
+    /// `type` attribute (mainly meaningful for `<input>`).
+    #[serde(rename = "inputType")]
+    pub input_type: Option<String>,
+    /// `name` attribute, when present and non-empty.
+    pub name: Option<String>,
+    /// `aria-label` attribute, when present and non-empty.
+    #[serde(rename = "ariaLabel")]
+    pub aria_label: Option<String>,
+    /// `placeholder` attribute, when present and non-empty.
+    pub placeholder: Option<String>,
+    /// Whether the `disabled` attribute is present.
+    pub disabled: bool,
+    /// Unique CSS selector path (`#id` short-circuits for valid CSS
+    /// identifiers, otherwise `[id="…"]`; plus `tag` /
+    /// `tag:nth-of-type(n)` steps joined by `" > "`).
+    pub selector: String,
+}
+
+/// Tags that are interactive regardless of attributes.
+fn is_interactive_tag(tag: &str) -> bool {
+    matches!(tag, "a" | "button" | "input" | "select" | "textarea")
+}
+
+/// ARIA roles that make an element interactive via the `role` attribute.
+fn is_interactive_role(role: &str) -> bool {
+    matches!(role, "button" | "link" | "tab" | "checkbox" | "radio")
+}
+
+/// Interactivity heuristic for a single node: interactive tag, `onclick`
+/// attribute, interactive `role`, or `tabindex >= 0`.
+pub fn is_interactive_element(node: &DomNode) -> bool {
+    if node.node_type != 1 {
+        return false;
+    }
+    if is_interactive_tag(&node.tag.to_lowercase()) {
+        return true;
+    }
+    if node.attributes.contains_key("onclick") {
+        return true;
+    }
+    if node
+        .attributes
+        .get("role")
+        .is_some_and(|r| is_interactive_role(r.trim().to_lowercase().as_str()))
+    {
+        return true;
+    }
+    node.attributes
+        .get("tabindex")
+        .and_then(|t| t.trim().parse::<i32>().ok())
+        .is_some_and(|t| t >= 0)
+}
+
+/// Computed role for an interactive element: the explicit `role` attribute
+/// wins; otherwise the implicit role of the tag — consistent with the
+/// accessibility tree's implicit roles (a → link, button → button,
+/// select → listbox, textarea → textbox, input per type).
+pub fn compute_interactive_role(node: &DomNode) -> String {
+    if let Some(role) = node.attributes.get("role") {
+        let role = role.trim();
+        if !role.is_empty() {
+            return role.to_string();
+        }
+    }
+    let type_attr = || {
+        node.attributes
+            .get("type")
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default()
+    };
+    match node.tag.to_lowercase().as_str() {
+        "a" => "link".into(),
+        "button" => "button".into(),
+        "select" => "listbox".into(),
+        "textarea" => "textbox".into(),
+        "input" => match type_attr().as_str() {
+            "checkbox" => "checkbox".into(),
+            "radio" => "radio".into(),
+            "button" | "submit" | "reset" => "button".into(),
+            _ => "textbox".into(),
+        },
+        _ => "generic".into(),
+    }
+}
+
+impl DomSnapshot {
+    /// All interactive elements in document order (iterative DFS pre-order,
+    /// same traversal as `headings`/`links`).
+    pub fn interactive_elements(&self) -> Vec<InteractiveElement> {
+        let mut result: Vec<InteractiveElement> = Vec::new();
+        let mut stack = vec![self.root_id];
+        while let Some(id) = stack.pop() {
+            if let Some(node) = self.nodes.get(&id) {
+                if node.node_type == 1 && is_interactive_element(node) {
+                    let element = self.build_interactive_element(node, result.len());
+                    result.push(element);
+                }
+                for &child in node.children.iter().rev() {
+                    stack.push(child);
+                }
+            }
+        }
+        result
+    }
+
+    fn build_interactive_element(&self, node: &DomNode, index: usize) -> InteractiveElement {
+        let full_text = self.deep_text_content(node.id);
+        let text: String = full_text.chars().take(MAX_INTERACTIVE_TEXT_CHARS).collect();
+        let attr = |name: &str| {
+            node.attributes
+                .get(name)
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+        };
+        InteractiveElement {
+            node_id: node.id,
+            index,
+            tag: node.tag.to_lowercase(),
+            role: compute_interactive_role(node),
+            text,
+            href: attr("href"),
+            input_type: attr("type"),
+            name: attr("name"),
+            aria_label: attr("aria-label"),
+            placeholder: attr("placeholder"),
+            disabled: node.attributes.contains_key("disabled"),
+            selector: self.css_selector_path(node.id),
+        }
+    }
+
+    /// Unique CSS selector path for `node_id`.
+    ///
+    /// Climbs toward the document root emitting `tag` steps
+    /// (`tag:nth-of-type(n)` when same-tag element siblings exist) and stops
+    /// early at a non-empty `id` — ids are unique, so ancestors add nothing.
+    /// The `#id` short form is only emitted when the id is a valid CSS
+    /// identifier (`[A-Za-z][A-Za-z0-9_-]*` or `--*`); otherwise the
+    /// attribute form `[id="<escaped>"]` is used. Per CSS `nth-of-type`
+    /// rules, only element siblings with the same tag count; text/comment
+    /// siblings are ignored.
+    pub fn css_selector_path(&self, node_id: u32) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let Some(node) = self.nodes.get(&id) else {
+                break;
+            };
+            if node.node_type == 9 {
+                break; // the document node itself is not part of the path
+            }
+            if let Some(id_attr) = node.attributes.get("id").filter(|v| !v.trim().is_empty()) {
+                let trimmed = id_attr.trim();
+                if is_valid_css_identifier(trimmed) {
+                    parts.push(format!("#{trimmed}"));
+                } else {
+                    // `#a.b` parses as id `a` + class `.b` and `#1x` is not
+                    // valid CSS — fall back to the attribute form, which
+                    // `query_selector` supports.
+                    parts.push(format!("[id=\"{}\"]", escape_css_attr_value(id_attr)));
+                }
+                break;
+            }
+            let tag = node.tag.to_lowercase();
+            let (mut position, mut total) = (0usize, 0usize);
+            if let Some(parent) = node.parent.and_then(|p| self.nodes.get(&p)) {
+                for &sibling in &parent.children {
+                    if let Some(s) = self.nodes.get(&sibling)
+                        && s.node_type == 1
+                        && s.tag.eq_ignore_ascii_case(&node.tag)
+                    {
+                        total += 1;
+                        if s.id == node.id {
+                            position = total;
+                        }
+                    }
+                }
+            }
+            parts.push(if total <= 1 {
+                tag
+            } else {
+                format!("{tag}:nth-of-type({position})")
+            });
+            current = node.parent;
+        }
+        parts.reverse();
+        parts.join(" > ")
+    }
+}
+
+/// True when `id` can be referenced by a bare `#id` selector: a CSS
+/// identifier (`[A-Za-z][A-Za-z0-9_-]*`) or a custom ident (`--*`).
+/// Anything else (leading digits, `.`, `:`, whitespace, …) would either be
+/// misparsed or is invalid CSS.
+fn is_valid_css_identifier(id: &str) -> bool {
+    if let Some(rest) = id.strip_prefix("--") {
+        return rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    }
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Escape a raw attribute value for use inside `[id="<value>"]`: backslash
+/// and double-quote are backslash-escaped, everything else is emitted as-is.
+fn escape_css_attr_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2182,5 +2430,188 @@ mod tests {
             .values()
             .any(|n| n.attributes.get("id").map(|s| s.as_str()) == Some("leaf"));
         assert!(!still_present, "<span id=leaf> purged from nodes");
+    }
+
+    // ── OXI.getInteractiveElements ──────────────────────────────────────────
+
+    #[test]
+    fn test_interactive_elements_by_tag() {
+        let html = r#"<html><body>
+            <a href="/l">link text</a>
+            <button disabled>go</button>
+            <input type="text" name="q" placeholder="search" aria-label="query">
+            <select name="s"><option value="1">one</option></select>
+            <textarea name="t"></textarea>
+        </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+
+        let els = snapshot.interactive_elements();
+        assert_eq!(els.len(), 5, "one entry per interactive tag");
+        assert!(els.iter().enumerate().all(|(i, e)| e.index == i));
+
+        assert_eq!(els[0].tag, "a");
+        assert_eq!(els[0].role, "link");
+        assert_eq!(els[0].href.as_deref(), Some("/l"));
+        assert_eq!(els[0].text, "link text");
+
+        assert_eq!(els[1].tag, "button");
+        assert_eq!(els[1].role, "button");
+        assert!(els[1].disabled, "disabled attribute flagged");
+
+        assert_eq!(els[2].tag, "input");
+        assert_eq!(els[2].input_type.as_deref(), Some("text"));
+        assert_eq!(els[2].name.as_deref(), Some("q"));
+        assert_eq!(els[2].placeholder.as_deref(), Some("search"));
+        assert_eq!(els[2].aria_label.as_deref(), Some("query"));
+        assert!(!els[2].disabled);
+
+        assert_eq!(els[3].tag, "select");
+        assert_eq!(els[3].role, "listbox");
+        assert_eq!(els[3].name.as_deref(), Some("s"));
+
+        assert_eq!(els[4].tag, "textarea");
+        assert_eq!(els[4].role, "textbox");
+        assert!(els[4].text.is_empty(), "empty textarea has no text");
+    }
+
+    #[test]
+    fn test_interactive_role_onclick_tabindex_detection() {
+        let html = r#"<html><body>
+            <span role="button" id="rb">press</span>
+            <span role="link">home</span>
+            <div role="tab">tab one</div>
+            <div role="checkbox" aria-label="check"></div>
+            <span role="radio"></span>
+            <div onclick="go()">clickable</div>
+            <div tabindex="0">focusable</div>
+            <div tabindex="-1">not in tab order</div>
+        </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+
+        let els = snapshot.interactive_elements();
+        // tabindex="-1" must be excluded.
+        assert_eq!(els.len(), 7, "got: {:?}", els.iter().map(|e| &e.selector));
+
+        let roles: Vec<&str> = els.iter().map(|e| e.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["button", "link", "tab", "checkbox", "radio", "generic", "generic"]
+        );
+        // Non-interactive tags get a generic role unless an explicit one exists.
+        assert_eq!(els[5].tag, "div");
+        assert_eq!(els[6].tag, "div");
+    }
+
+    #[test]
+    fn test_interactive_excludes_non_interactive() {
+        let html = r#"<html><body>
+            <p>plain paragraph</p>
+            <div>plain div</div>
+            <span>plain span</span>
+            <span role="heading">not interactive</span>
+            <div role="article">also not</div>
+            <h1>heading</h1>
+        </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+        assert!(
+            snapshot.interactive_elements().is_empty(),
+            "no false positives on static content"
+        );
+    }
+
+    #[test]
+    fn test_interactive_selector_uniqueness() {
+        use std::collections::HashSet;
+
+        let html = r#"<html><body>
+            <button>a</button>
+            <button>b</button>
+            <div>
+                <button>c</button>
+                <button>d</button>
+            </div>
+            <span id="uniq" onclick="">x</span>
+        </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+
+        let els = snapshot.interactive_elements();
+        assert_eq!(els.len(), 5);
+
+        let selectors: Vec<&str> = els.iter().map(|e| e.selector.as_str()).collect();
+        assert_eq!(selectors[0], "html > body > button:nth-of-type(1)");
+        assert_eq!(selectors[1], "html > body > button:nth-of-type(2)");
+        assert_eq!(selectors[2], "html > body > div > button:nth-of-type(1)");
+        assert_eq!(selectors[3], "html > body > div > button:nth-of-type(2)");
+        assert_eq!(selectors[4], "#uniq", "id short-circuits the path");
+
+        assert_eq!(
+            selectors.iter().collect::<HashSet<_>>().len(),
+            selectors.len(),
+            "every selector must be unique"
+        );
+    }
+
+    #[test]
+    fn test_css_selector_path_escapes_unsafe_ids() {
+        let html = r#"<html><body>
+            <button id="a.b">one</button>
+            <button id="1x">two</button>
+            <button id="he said &quot;hi&quot;">three</button>
+            <button id="normal-id">four</button>
+        </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+
+        let els = snapshot.interactive_elements();
+        assert_eq!(els.len(), 4);
+        let selectors: Vec<&str> = els.iter().map(|e| e.selector.as_str()).collect();
+
+        // `.` would parse as a class separator in `#a.b`.
+        assert_eq!(selectors[0], r#"[id="a.b"]"#, "dot in id uses attribute form");
+        // A leading digit is invalid CSS in `#1x`.
+        assert_eq!(selectors[1], r#"[id="1x"]"#, "leading digit uses attribute form");
+        // Double quotes in the id are backslash-escaped inside the attribute form.
+        assert_eq!(selectors[2], r#"[id="he said \"hi\""]"#);
+        // A valid identifier keeps the `#` short form.
+        assert_eq!(selectors[3], "#normal-id", "valid identifier keeps # short form");
+
+        // The attribute form must actually resolve through query_selector.
+        assert!(
+            snapshot.query_selector(r#"[id="a.b"]"#).is_some(),
+            "[id=\"a.b\"] must match the element"
+        );
+        assert!(
+            snapshot.query_selector(r#"[id="1x"]"#).is_some(),
+            "[id=\"1x\"] must match the element"
+        );
+        assert!(
+            snapshot.query_selector("#normal-id").is_some(),
+            "#normal-id must match the element"
+        );
+    }
+
+    #[test]
+    fn test_is_valid_css_identifier() {
+        assert!(is_valid_css_identifier("a"));
+        assert!(is_valid_css_identifier("uniq-1_x"));
+        assert!(is_valid_css_identifier("--custom"));
+        assert!(is_valid_css_identifier("--"));
+        assert!(!is_valid_css_identifier("a.b"));
+        assert!(!is_valid_css_identifier("1x"));
+        assert!(!is_valid_css_identifier("-x"));
+        assert!(!is_valid_css_identifier("a b"));
+        assert!(!is_valid_css_identifier("a:b"));
+        assert!(!is_valid_css_identifier(""));
+    }
+
+    #[test]
+    fn test_interactive_text_trimmed_to_80_chars() {
+        let long = "x".repeat(200);
+        let html = format!(r#"<html><body><button>{long}</button></body></html>"#);
+        let snapshot = DomSnapshot::from_frame(&make_frame(&html));
+
+        let els = snapshot.interactive_elements();
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].text.chars().count(), 80);
+        assert!(els[0].text.starts_with("xxxx"), "text is the visible prefix");
     }
 }
