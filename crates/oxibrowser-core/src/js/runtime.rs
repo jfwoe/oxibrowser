@@ -6244,7 +6244,9 @@ fn create_render_element_object(
             let assigned = refresh_slot_assignments(&an_rd, node_id);
             let objs: Vec<JsValue> = assigned
                 .into_iter()
-                .map(|cid| create_render_element_object(ctx, an_rd.clone(), cid as usize, an_dirty.clone()))
+                .map(|cid| {
+                    create_render_element_object(ctx, an_rd.clone(), cid as usize, an_dirty.clone())
+                })
                 .collect();
             Ok(JsArray::from_iter(objs, ctx).into())
         })
@@ -6263,7 +6265,9 @@ fn create_render_element_object(
                         .and_then(|d| d.tag_name(*cid as usize))
                         .is_some()
                 })
-                .map(|cid| create_render_element_object(ctx, ae_rd.clone(), cid as usize, ae_dirty.clone()))
+                .map(|cid| {
+                    create_render_element_object(ctx, ae_rd.clone(), cid as usize, ae_dirty.clone())
+                })
                 .collect();
             Ok(JsArray::from_iter(objs, ctx).into())
         })
@@ -6485,7 +6489,12 @@ fn register_document_object(
                 guard.as_ref().and_then(|doc| doc.query_selector(&selector))
             };
             if let Some(nid) = nid_opt {
-                return Ok(create_render_element_object(ctx, rd_qs.clone(), nid, dirty_qs.clone()));
+                return Ok(create_render_element_object(
+                    ctx,
+                    rd_qs.clone(),
+                    nid,
+                    dirty_qs.clone(),
+                ));
             }
 
             let dom = dom_capture_qs.read();
@@ -6529,7 +6538,9 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_qsa.clone(), nid, dirty_qsa.clone()))
+                    .map(|nid| {
+                        create_render_element_object(ctx, rd_qsa.clone(), nid, dirty_qsa.clone())
+                    })
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6581,7 +6592,12 @@ fn register_document_object(
                     .and_then(|doc| doc.query_selector(&format!("#{id}")))
             };
             if let Some(nid) = nid_opt {
-                return Ok(create_render_element_object(ctx, rd_gbi.clone(), nid, dirty_gbi.clone()));
+                return Ok(create_render_element_object(
+                    ctx,
+                    rd_gbi.clone(),
+                    nid,
+                    dirty_gbi.clone(),
+                ));
             }
 
             let dom = dom_capture_gbi.read();
@@ -6625,7 +6641,9 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_gtn.clone(), nid, dirty_gtn.clone()))
+                    .map(|nid| {
+                        create_render_element_object(ctx, rd_gtn.clone(), nid, dirty_gtn.clone())
+                    })
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6680,7 +6698,9 @@ fn register_document_object(
             if !ids.is_empty() {
                 let js_values: Vec<JsValue> = ids
                     .into_iter()
-                    .map(|nid| create_render_element_object(ctx, rd_gcn.clone(), nid, dirty_gcn.clone()))
+                    .map(|nid| {
+                        create_render_element_object(ctx, rd_gcn.clone(), nid, dirty_gcn.clone())
+                    })
                     .collect();
                 let arr = JsArray::from_iter(js_values, ctx);
                 return Ok(arr.into());
@@ -6847,7 +6867,12 @@ fn register_document_object(
                     guard.as_ref().and_then(|doc| doc.query_selector("body"))
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_body.clone(), nid, dirty_body.clone()));
+                    return Ok(create_render_element_object(
+                        ctx,
+                        rd_body.clone(),
+                        nid,
+                        dirty_body.clone(),
+                    ));
                 }
 
                 let snap = dom_snap_body.read();
@@ -6885,7 +6910,12 @@ fn register_document_object(
                     guard.as_ref().and_then(|doc| doc.query_selector("head"))
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_head.clone(), nid, dirty_head.clone()));
+                    return Ok(create_render_element_object(
+                        ctx,
+                        rd_head.clone(),
+                        nid,
+                        dirty_head.clone(),
+                    ));
                 }
 
                 let snap = dom_snap_head.read();
@@ -6922,7 +6952,12 @@ fn register_document_object(
                     guard.as_ref().map(|doc| doc.root_element_id())
                 };
                 if let Some(nid) = nid_opt {
-                    return Ok(create_render_element_object(ctx, rd_de.clone(), nid, dirty_de.clone()));
+                    return Ok(create_render_element_object(
+                        ctx,
+                        rd_de.clone(),
+                        nid,
+                        dirty_de.clone(),
+                    ));
                 }
 
                 let snap = dom_snap_de.read();
@@ -10284,9 +10319,13 @@ fn register_window_globals(
                         // Document node (same walk as the live document).
                         let html_node = s.nodes.get(&s.root_id).and_then(|root| {
                             root.children.iter().find_map(|&child_id| {
-                                s.nodes
-                                    .get(&child_id)
-                                    .and_then(|n| if n.tag == "html" { Some((child_id, n)) } else { None })
+                                s.nodes.get(&child_id).and_then(|n| {
+                                    if n.tag == "html" {
+                                        Some((child_id, n))
+                                    } else {
+                                        None
+                                    }
+                                })
                             })
                         });
                         if let Some((_, node)) = html_node {
@@ -13196,9 +13235,7 @@ mod tests {
     async fn test_clamped_timer_delays_schedule_without_panic() {
         let mut rt = JsRuntime::new();
         let ric = rt
-            .evaluate(
-                "requestIdleCallback(function () {}, { timeout: Infinity })",
-            )
+            .evaluate("requestIdleCallback(function () {}, { timeout: Infinity })")
             .await
             .expect("requestIdleCallback with Infinity timeout must not panic");
         assert!(
@@ -13263,11 +13300,9 @@ mod tests {
 
         // Attribute + event bindings on a live render element (query the
         // intact document first: body.textContent below replaces children).
-        rt.evaluate(
-            "document.getElementById('p').setAttribute('data-k', 'v')",
-        )
-        .await
-        .unwrap();
+        rt.evaluate("document.getElementById('p').setAttribute('data-k', 'v')")
+            .await
+            .unwrap();
         assert!(rt.take_dom_dirty(), "setAttribute must mark dirty");
 
         rt.evaluate("document.getElementById('p').click()")
@@ -13277,7 +13312,9 @@ mod tests {
         assert!(!rt.take_dom_dirty(), "take_dom_dirty must reset the flag");
 
         // textContent setter mutates the doc directly.
-        rt.evaluate("document.body.textContent = 'x'").await.unwrap();
+        rt.evaluate("document.body.textContent = 'x'")
+            .await
+            .unwrap();
         assert!(rt.take_dom_dirty(), "textContent setter must mark dirty");
         assert!(!rt.take_dom_dirty(), "flag must be clear after take");
     }
@@ -13358,10 +13395,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_ok());
-        assert_eq!(
-            result.value,
-            Some(Value::String("TypeError:true".into()))
-        );
+        assert_eq!(result.value, Some(Value::String("TypeError:true".into())));
     }
 
     #[tokio::test]
@@ -14621,10 +14655,7 @@ mod tests {
         // (children/parentNode). JSON.stringify inside js_value_to_json walked
         // them without termination and overflowed the JS thread stack. A live
         // element as the final eval result must serialize, not crash.
-        let result = rt
-            .evaluate("document.getElementById('a')")
-            .await
-            .unwrap();
+        let result = rt.evaluate("document.getElementById('a')").await.unwrap();
         assert!(result.is_ok());
         assert!(result.value.is_some());
     }
@@ -14922,9 +14953,17 @@ mod tests {
             panic!("structuredClone eval failed: {:?}", r.exception);
         }
         let obj = r.value.expect("json object");
-        assert_eq!(obj["deep"], serde_json::json!(2), "nested array deep-cloned");
+        assert_eq!(
+            obj["deep"],
+            serde_json::json!(2),
+            "nested array deep-cloned"
+        );
         assert_eq!(obj["date"], serde_json::json!(true), "Date cloned by value");
-        assert_eq!(obj["re"], serde_json::json!(true), "RegExp cloned with flags");
+        assert_eq!(
+            obj["re"],
+            serde_json::json!(true),
+            "RegExp cloned with flags"
+        );
         assert_eq!(obj["map"], serde_json::json!(true), "Map cloned by value");
         assert_eq!(obj["set"], serde_json::json!(true), "Set cloned by value");
         assert_eq!(

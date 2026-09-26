@@ -401,14 +401,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let b = Page::from_html(
-            url,
-            &make_test_html("Gen B"),
-            200,
-            "text/html".to_string(),
-        )
-        .await
-        .unwrap();
+        let b = Page::from_html(url, &make_test_html("Gen B"), 200, "text/html".to_string())
+            .await
+            .unwrap();
 
         assert_ne!(a.generation(), b.generation(), "fresh pages differ");
     }

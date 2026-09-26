@@ -27,7 +27,7 @@ pub mod error;
 /// Blank white PNG fallback (re-exported from the render crate).
 pub use oxibrowser_render::blank_png;
 pub use oxibrowser_render::png_to_pdf;
-pub use oxibrowser_render::{png_to_pdf_paged, PdfOrientation, PdfPageOptions, PdfPageSize};
+pub use oxibrowser_render::{PdfOrientation, PdfPageOptions, PdfPageSize, png_to_pdf_paged};
 
 pub use browse_result::BrowseResult;
 pub use browser::Browser;

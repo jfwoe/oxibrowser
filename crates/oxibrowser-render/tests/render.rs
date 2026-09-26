@@ -217,7 +217,11 @@ fn png_to_pdf_paged_letter_page_count() {
         margin_mm: 10.0,
     };
     let pdf = png_to_pdf_paged(&blank_png(190, 2520), &opts).expect("valid PNG must paginate");
-    assert_eq!(count_page_objects(&pdf), 10, "2520px @ Letter/m10 == 10 pages");
+    assert_eq!(
+        count_page_objects(&pdf),
+        10,
+        "2520px @ Letter/m10 == 10 pages"
+    );
 }
 
 /// A4 landscape with 10 mm margins: content 277 × 190 mm; a 190 px wide image
@@ -230,7 +234,11 @@ fn png_to_pdf_paged_landscape_page_count() {
         margin_mm: 10.0,
     };
     let pdf = png_to_pdf_paged(&blank_png(190, 1300), &opts).expect("valid PNG must paginate");
-    assert_eq!(count_page_objects(&pdf), 10, "1300px @ A4-landscape/m10 == 10 pages");
+    assert_eq!(
+        count_page_objects(&pdf),
+        10,
+        "1300px @ A4-landscape/m10 == 10 pages"
+    );
 }
 
 /// Undecodable input must surface as `Err`, not collapse into an empty PDF.
@@ -246,10 +254,13 @@ fn png_to_pdf_paged_rejects_undecodable_png() {
 /// `/Type/Page`; the page-tree node `/Type/Pages` also contains that
 /// substring, so subtract its occurrences.
 fn count_page_objects(pdf: &[u8]) -> usize {
-    let page = pdf.windows(b"/Type/Page".len()).filter(|w| *w == b"/Type/Page").count();
-    let pages = pdf.windows(b"/Type/Pages".len()).filter(|w| *w == b"/Type/Pages").count();
+    let page = pdf
+        .windows(b"/Type/Page".len())
+        .filter(|w| *w == b"/Type/Page")
+        .count();
+    let pages = pdf
+        .windows(b"/Type/Pages".len())
+        .filter(|w| *w == b"/Type/Pages")
+        .count();
     page - pages
 }
-
-
-

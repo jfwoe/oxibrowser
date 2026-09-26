@@ -173,14 +173,15 @@ fn page_size_mm(size: PdfPageSize, orientation: PdfOrientation) -> (f64, f64) {
 /// 16-bit bytes as if they were 8-bit would garble every slice downstream.
 fn decode_png_rgba(png: &[u8]) -> Result<(Vec<u8>, usize, usize), RenderError> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
-    decoder
-        .set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::STRIP_16);
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::STRIP_16,
+    );
     let mut reader = decoder
         .read_info()
         .map_err(|e| RenderError::Decode(format!("png header decode failed: {e}")))?;
-    let size = reader.output_buffer_size().ok_or_else(|| {
-        RenderError::Decode("png output buffer size overflow".to_string())
-    })?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| RenderError::Decode("png output buffer size overflow".to_string()))?;
     let mut buf = vec![0u8; size];
     let info = reader
         .next_frame(&mut buf)
@@ -218,7 +219,7 @@ fn decode_png_rgba(png: &[u8]) -> Result<(Vec<u8>, usize, usize), RenderError> {
         other => {
             return Err(RenderError::Decode(format!(
                 "unsupported PNG color type: {other:?}"
-            )))
+            )));
         }
     };
     Ok((rgba, iw, ih))
@@ -260,9 +261,8 @@ pub fn png_to_pdf_paged(png: &[u8], opts: &PdfPageOptions) -> Result<Vec<u8>, Re
         // Pad the final remainder white to a full page's content height.
         slice.resize(slice_rows * iw * 4, 0xFF);
         let slice_png = encode_png(&slice, iw as u32, slice_rows as u32)?;
-        let raw = RawImage::decode_from_bytes(&slice_png, &mut warnings).map_err(|e| {
-            RenderError::Decode(format!("pdf image re-decode failed: {e}"))
-        })?;
+        let raw = RawImage::decode_from_bytes(&slice_png, &mut warnings)
+            .map_err(|e| RenderError::Decode(format!("pdf image re-decode failed: {e}")))?;
         let img_id = doc.add_image(&raw);
 
         // PDF origin is bottom-left; every page carries one slice at the top
@@ -324,7 +324,13 @@ mod tests {
         for s in samples {
             data.extend_from_slice(&s.to_be_bytes());
         }
-        let png = encode_png_bytes(png::ColorType::Grayscale, png::BitDepth::Sixteen, 3, 2, &data);
+        let png = encode_png_bytes(
+            png::ColorType::Grayscale,
+            png::BitDepth::Sixteen,
+            3,
+            2,
+            &data,
+        );
 
         let (rgba, iw, ih) = decode_png_rgba(&png).expect("16-bit grayscale must decode");
         assert_eq!((iw, ih), (3, 2));
@@ -334,7 +340,11 @@ mod tests {
             assert_eq!(px[0], px[1]);
             assert_eq!(px[1], px[2]);
             assert_eq!(px[3], 0xFF, "grayscale is opaque");
-            assert!(px[0] >= prev, "gray values must be monotonic, got {} after {prev}", px[0]);
+            assert!(
+                px[0] >= prev,
+                "gray values must be monotonic, got {} after {prev}",
+                px[0]
+            );
             prev = px[0];
         }
     }

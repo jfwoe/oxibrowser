@@ -704,8 +704,8 @@ impl ScreencastGate {
     /// Evaluate one pump tick against the current document generation.
     fn on_tick(&mut self, generation: u64) -> ScreencastDecision {
         self.ticks_since_frame = self.ticks_since_frame.saturating_add(1);
-        let sample =
-            self.last_emitted_generation.is_none() || self.ticks_since_frame >= self.every_nth_frame;
+        let sample = self.last_emitted_generation.is_none()
+            || self.ticks_since_frame >= self.every_nth_frame;
         if !sample {
             return ScreencastDecision::Skip;
         }
@@ -790,7 +790,14 @@ async fn start_screencast(params: Option<Value>, ctx: &DispatchContext) -> Domai
     let session = ctx.session.clone();
     let events = ctx.events.clone();
     let sid = stream_id;
-    tokio::spawn(screencast_pump(session, events, sid, gate, active, stream_params));
+    tokio::spawn(screencast_pump(
+        session,
+        events,
+        sid,
+        gate,
+        active,
+        stream_params,
+    ));
 
     Ok(Some(json!({})))
 }
@@ -998,7 +1005,12 @@ fn encode_screencast_frame(png: &[u8], params: ScreencastParams) -> Option<(Stri
             let mut encoder =
                 JpegEncoder::new_with_quality(&mut encoded, params.quality.clamp(0, 100) as u8);
             encoder
-                .encode(img.to_rgb8().as_raw(), width, height, image::ExtendedColorType::Rgb8)
+                .encode(
+                    img.to_rgb8().as_raw(),
+                    width,
+                    height,
+                    image::ExtendedColorType::Rgb8,
+                )
                 .ok()?;
         }
         ScreencastFormat::Png => {
@@ -1124,8 +1136,7 @@ mod tests {
 
     #[test]
     fn test_screencast_params_max_dimensions() {
-        let params =
-            ScreencastParams::from_params(&json!({ "maxWidth": 640, "maxHeight": 480 }));
+        let params = ScreencastParams::from_params(&json!({ "maxWidth": 640, "maxHeight": 480 }));
         assert_eq!(params.max_width, Some(640));
         assert_eq!(params.max_height, Some(480));
     }
@@ -1133,8 +1144,9 @@ mod tests {
     #[test]
     fn test_encode_screencast_frame_png_respects_max_dimensions() {
         let png = oxibrowser_core::blank_png(800, 600);
-        let params =
-            ScreencastParams::from_params(&json!({ "format": "png", "maxWidth": 400, "maxHeight": 400 }));
+        let params = ScreencastParams::from_params(
+            &json!({ "format": "png", "maxWidth": 400, "maxHeight": 400 }),
+        );
         let (data, width, height) = encode_screencast_frame(&png, params).expect("encode");
         assert_eq!((width, height), (400, 300), "aspect preserved, downscaled");
         let decoded = base64::engine::general_purpose::STANDARD
@@ -1174,9 +1186,11 @@ mod tests {
     fn test_print_to_pdf_margin_averages_only_provided_values() {
         // A single provided margin is not quartered.
         let one = margin_mm_from_params(&json!({ "marginTop": 1.0 }));
-        assert!((one - 25.4).abs() < 1e-9, "1in alone must stay 25.4mm, got {one}");
-        let two =
-            margin_mm_from_params(&json!({ "marginTop": 1.0, "marginBottom": 2.0 }));
+        assert!(
+            (one - 25.4).abs() < 1e-9,
+            "1in alone must stay 25.4mm, got {one}"
+        );
+        let two = margin_mm_from_params(&json!({ "marginTop": 1.0, "marginBottom": 2.0 }));
         assert!(
             (two - 38.1).abs() < 1e-9,
             "mean of 1in+2in must be 38.1mm, got {two}"

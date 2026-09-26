@@ -2495,7 +2495,9 @@ mod tests {
         let roles: Vec<&str> = els.iter().map(|e| e.role.as_str()).collect();
         assert_eq!(
             roles,
-            vec!["button", "link", "tab", "checkbox", "radio", "generic", "generic"]
+            vec![
+                "button", "link", "tab", "checkbox", "radio", "generic", "generic"
+            ]
         );
         // Non-interactive tags get a generic role unless an explicit one exists.
         assert_eq!(els[5].tag, "div");
@@ -2566,13 +2568,22 @@ mod tests {
         let selectors: Vec<&str> = els.iter().map(|e| e.selector.as_str()).collect();
 
         // `.` would parse as a class separator in `#a.b`.
-        assert_eq!(selectors[0], r#"[id="a.b"]"#, "dot in id uses attribute form");
+        assert_eq!(
+            selectors[0], r#"[id="a.b"]"#,
+            "dot in id uses attribute form"
+        );
         // A leading digit is invalid CSS in `#1x`.
-        assert_eq!(selectors[1], r#"[id="1x"]"#, "leading digit uses attribute form");
+        assert_eq!(
+            selectors[1], r#"[id="1x"]"#,
+            "leading digit uses attribute form"
+        );
         // Double quotes in the id are backslash-escaped inside the attribute form.
         assert_eq!(selectors[2], r#"[id="he said \"hi\""]"#);
         // A valid identifier keeps the `#` short form.
-        assert_eq!(selectors[3], "#normal-id", "valid identifier keeps # short form");
+        assert_eq!(
+            selectors[3], "#normal-id",
+            "valid identifier keeps # short form"
+        );
 
         // The attribute form must actually resolve through query_selector.
         assert!(
@@ -2612,6 +2623,9 @@ mod tests {
         let els = snapshot.interactive_elements();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text.chars().count(), 80);
-        assert!(els[0].text.starts_with("xxxx"), "text is the visible prefix");
+        assert!(
+            els[0].text.starts_with("xxxx"),
+            "text is the visible prefix"
+        );
     }
 }
