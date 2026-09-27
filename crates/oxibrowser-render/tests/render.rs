@@ -62,8 +62,10 @@ fn renders_basic_html_to_valid_png() {
 
     // There must be non-white content: a red heading and a blue box.
     let non_white = buf
-        .chunks_exact(4)
-        .filter(|px| px != &[255, 255, 255, 255])
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| *px != &[255, 255, 255, 255])
         .count();
     assert!(
         non_white > 100,
@@ -154,7 +156,9 @@ fn mutation_reflected_in_capture() {
     let mut buf = vec![0u8; reader.output_buffer_size().expect("buf size")];
     reader.next_frame(&mut buf).expect("read frame");
     let red = buf
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] > 200 && px[1] < 80 && px[2] < 80)
         .count();
     assert!(

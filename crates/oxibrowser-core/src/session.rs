@@ -3104,12 +3104,12 @@ mod tests {
 
     /// `DOWNLOAD_DIR` is a process-wide static — tests that touch it
     /// (override set/clear or the config-fallback path) hold this guard.
-    static DOWNLOAD_DIR_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static DOWNLOAD_DIR_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn test_download_save_failure_emits_download_failed() {
-        let _guard = DOWNLOAD_DIR_GUARD.lock();
         let mut session = make_session().await;
+        let _guard = DOWNLOAD_DIR_GUARD.lock().await;
         let (tx, rx) = std::sync::mpsc::channel();
         session.set_event_sink(tx);
 
@@ -3139,8 +3139,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_uses_config_download_dir_when_override_unset() {
-        let _guard = DOWNLOAD_DIR_GUARD.lock();
         let mut session = make_session().await;
+        let _guard = DOWNLOAD_DIR_GUARD.lock().await;
         // No CDP override: the config field resolves the target directory.
         let dir = std::env::temp_dir().join(format!("oxi-dl-cfg-{}", uuid::Uuid::new_v4()));
         session.config.download_dir = Some(dir.clone());
@@ -3192,7 +3192,7 @@ mod tests {
             .await;
 
         let dir = std::env::temp_dir().join(format!("oxi-dl-{}", uuid::Uuid::new_v4()));
-        let _guard = DOWNLOAD_DIR_GUARD.lock();
+        let _guard = DOWNLOAD_DIR_GUARD.lock().await;
         set_download_behavior(Some(dir.clone()));
 
         let mut session = make_session().await;

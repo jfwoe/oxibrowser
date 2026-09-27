@@ -252,12 +252,12 @@ mod tests {
     // The device metrics override lives in a process-global static, so tests
     // that touch it must run serially to avoid cross-contamination when cargo
     // runs them on multiple threads.
-    static TEST_LOCK: LazyLock<parking_lot::Mutex<()>> =
-        LazyLock::new(|| parking_lot::Mutex::new(()));
+    static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Acquire the serial-test guard. RAII — released on drop.
-    fn serial() -> parking_lot::MutexGuard<'static, ()> {
-        TEST_LOCK.lock()
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().await
     }
 
     /// Build a DispatchContext backed by a real Browser session.
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_device_metrics_override_stores_values() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_device_metrics_override_returns_empty_and_clears_state() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = Some(DeviceMetrics {
             width: 100,
@@ -406,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_device_metrics_override_clamps_zero_dimensions() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
@@ -425,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_device_metrics_override_applies_defaults_when_params_missing() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
@@ -459,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_emulated_media_applies_dark_and_light() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
 
         let result = handle(
@@ -489,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_emulated_media_ignores_unsupported_features() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
 
         let result = handle(
@@ -517,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_emulated_media_empty_or_missing_features_clear() {
-        let _g = serial();
+        let _g = serial().await;
         let ctx = make_ctx().await;
 
         handle(

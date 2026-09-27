@@ -336,7 +336,7 @@ mod tests {
         assert_eq!((iw, ih), (3, 2));
         assert_eq!(rgba.len(), 3 * 2 * 4, "exactly one RGBA8 quad per pixel");
         let mut prev: u8 = 0;
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             assert_eq!(px[0], px[1]);
             assert_eq!(px[1], px[2]);
             assert_eq!(px[3], 0xFF, "grayscale is opaque");

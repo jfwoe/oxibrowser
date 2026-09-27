@@ -13626,8 +13626,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_user_agent_overrides_navigator_immediately() {
-        let mut config = JsRuntimeConfig::default();
-        config.user_agent = "ConfigUA/1.0".to_string();
+        let config = JsRuntimeConfig {
+            user_agent: "ConfigUA/1.0".to_string(),
+            ..Default::default()
+        };
         let mut rt = JsRuntime::with_config(config);
 
         let before = rt.evaluate("navigator.userAgent").await.unwrap();
