@@ -8,10 +8,14 @@ use crate::domains::fetch::FetchPattern;
 use crate::protocol::CdpEvent;
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Maximum number of lifecycle events buffered for `Page.getLifecycleEvents`.
+/// Once full, the oldest entry is dropped to make room.
+const LIFECYCLE_BUFFER_CAP: usize = 20;
 
 /// Sender half of the event broadcaster.
 #[derive(Clone)]
@@ -23,6 +27,10 @@ pub struct EventSender {
     log_enabled: Arc<AtomicBool>,
     fetch_enabled: Arc<AtomicBool>,
     fetch_patterns: Arc<RwLock<Vec<FetchPattern>>>,
+    /// Buffered navigation lifecycle events `(method, params, timestamp)`,
+    /// recorded while the Page/lifecycle flag is enabled and drained by
+    /// `Page.getLifecycleEvents` (capped at `LIFECYCLE_BUFFER_CAP`).
+    lifecycle_buffer: Arc<Mutex<Vec<(String, Value, f64)>>>,
     /// Session ID stamped onto every CDP event once a target is attached
     /// (flat / auto-attach protocol). `None` for root-level events.
     attached_session_id: Arc<RwLock<Option<String>>>,
@@ -44,6 +52,7 @@ pub fn event_channel() -> (EventSender, EventReceiver) {
         log_enabled: Arc::new(AtomicBool::new(false)),
         fetch_enabled: Arc::new(AtomicBool::new(false)),
         fetch_patterns: Arc::new(RwLock::new(Vec::new())),
+        lifecycle_buffer: Arc::new(Mutex::new(Vec::new())),
         attached_session_id: Arc::new(RwLock::new(None)),
     };
     let receiver = EventReceiver { rx };
@@ -106,6 +115,7 @@ impl EventSender {
     /// Send a Page domain event (only if Page domain is enabled).
     pub fn send_page_event(&self, method: &str, params: Value) {
         if self.page_enabled.load(Ordering::Relaxed) {
+            self.record_lifecycle(method, &params);
             self.send_event(method, params);
         }
     }
@@ -113,8 +123,45 @@ impl EventSender {
     /// Page domain event stamped with an explicit `sessionId` (child target).
     pub fn send_page_event_with_session(&self, method: &str, params: Value, session_id: &str) {
         if self.page_enabled.load(Ordering::Relaxed) {
+            self.record_lifecycle(method, &params);
             self.send_event_with_session(method, params, session_id);
         }
+    }
+
+    /// Buffer one navigation lifecycle event for `Page.getLifecycleEvents`.
+    ///
+    /// Only the three navigation lifecycle events are recorded; the buffer is
+    /// capped at `LIFECYCLE_BUFFER_CAP`, dropping the oldest entry first.
+    fn record_lifecycle(&self, method: &str, params: &Value) {
+        const LIFECYCLE_METHODS: [&str; 3] = [
+            "Page.domContentLoadedEventFired",
+            "Page.loadEventFired",
+            "Page.frameNavigated",
+        ];
+        if !LIFECYCLE_METHODS.contains(&method) {
+            return;
+        }
+        let mut buffer = self
+            .lifecycle_buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if buffer.len() >= LIFECYCLE_BUFFER_CAP {
+            buffer.remove(0);
+        }
+        buffer.push((
+            method.to_string(),
+            params.clone(),
+            EventSender::timestamp_ms(),
+        ));
+    }
+
+    /// Snapshot of the buffered lifecycle events, oldest first (drained by
+    /// `Page.getLifecycleEvents`; the buffer itself is left intact).
+    pub fn lifecycle_events(&self) -> Vec<(String, Value, f64)> {
+        self.lifecycle_buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Send a Runtime domain event (only if Runtime domain is enabled).
@@ -171,6 +218,20 @@ impl EventSender {
         if self.log_enabled.load(Ordering::Relaxed) {
             self.send_event_with_session(method, params, session_id);
         }
+    }
+
+    /// Send a Browser domain event — **ungated**.
+    ///
+    /// There is no `Browser.enable` flag in this server: Chrome emits
+    /// `Browser.downloadWillBegin` / `Browser.downloadProgress` without a
+    /// domain-enable handshake, so these events go out on the event channel
+    /// as soon as they happen.
+    ///
+    /// Known limitation: events always target the root session (no
+    /// `sessionId` stamping) — downloads initiated by an attached child
+    /// target surface on the root session too.
+    pub fn send_browser_event(&self, method: &str, params: Value) {
+        self.send_event(method, params);
     }
 
     /// Enable Log domain events.
@@ -290,6 +351,34 @@ mod tests {
     }
 
     #[test]
+    fn test_lifecycle_buffer_records_only_lifecycle_methods_and_caps() {
+        let (sender, mut receiver) = event_channel();
+
+        // Not recorded while the lifecycle/Page flag is disabled.
+        sender.send_page_event("Page.frameNavigated", json!({ "frameId": "main" }));
+        assert!(sender.lifecycle_events().is_empty());
+
+        sender.set_page_enabled(true);
+        // Only the three navigation lifecycle methods are buffered.
+        sender.send_page_event("Page.screencastFrame", json!({}));
+        assert!(sender.lifecycle_events().is_empty());
+
+        // Cap at 20: the oldest entries are dropped first.
+        for i in 0..25 {
+            sender.send_page_event("Page.loadEventFired", json!({ "i": i }));
+        }
+        let buffered = sender.lifecycle_events();
+        assert_eq!(buffered.len(), 20, "buffer never exceeds the cap");
+        assert_eq!(buffered[0].0, "Page.loadEventFired");
+        assert_eq!(buffered[0].1["i"], 5, "oldest dropped past the cap");
+        assert_eq!(buffered[19].1["i"], 24);
+        assert!(buffered[0].2 > 0.0, "timestamp recorded");
+
+        // Buffered events still flow to the channel (25 lifecycle + 1 other).
+        assert_eq!(receiver.drain().len(), 26);
+    }
+
+    #[test]
     fn test_network_event_gated() {
         let (sender, mut receiver) = event_channel();
 
@@ -300,6 +389,27 @@ mod tests {
         sender.send_network_event("Network.requestWillBeSent", json!({ "requestId": "1" }));
         let events = receiver.drain();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_browser_event_ungated() {
+        // There is no Browser.enable flag: Browser.* events (download
+        // progress) must flow with every domain flag disabled.
+        let (sender, mut receiver) = event_channel();
+
+        sender.send_browser_event(
+            "Browser.downloadWillBegin",
+            json!({
+                "frameId": "",
+                "guid": "g1",
+                "url": "http://example.com/f.zip",
+                "suggestedFilename": "f.zip",
+            }),
+        );
+        let events = receiver.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "Browser.downloadWillBegin");
+        assert_eq!(events[0].params.as_ref().unwrap()["guid"], "g1");
     }
 
     #[tokio::test]
@@ -328,6 +438,7 @@ mod tests {
             log_enabled: Arc::new(AtomicBool::new(false)),
             fetch_enabled: Arc::new(AtomicBool::new(false)),
             fetch_patterns: Arc::new(RwLock::new(Vec::new())),
+            lifecycle_buffer: Arc::new(Mutex::new(Vec::new())),
             attached_session_id: Arc::new(RwLock::new(None)),
         };
 

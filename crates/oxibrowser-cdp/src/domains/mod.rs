@@ -22,14 +22,119 @@ use crate::protocol::CdpError;
 use oxibrowser_core::network::SharedRegistry;
 use oxibrowser_core::session::Session;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 
-/// Map of attached child-target sessionId → its Browser Session (multi-tab).
+/// A registered child target created via `Target.createTarget`.
+#[derive(Clone)]
+pub struct TargetEntry {
+    /// CDP targetId assigned at creation.
+    pub target_id: String,
+    /// The child browser session backing this target.
+    pub session: Arc<RwLock<Session>>,
+    /// Handle to the child's CoreEvent drainer task, aborted on close/detach.
+    pub drain_abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Registry of attached child targets (multi-tab), keyed by CDP sessionId.
 /// Populated by `Target.createTarget`; the dispatcher resolves the session for
 /// an incoming command from its `sessionId`.
-pub type ChildTargets = Arc<RwLock<HashMap<String, Arc<RwLock<Session>>>>>;
+pub struct TargetRegistry {
+    /// Child targets by sessionId.
+    pub by_session: RwLock<HashMap<String, TargetEntry>>,
+    /// SessionIds whose target has been closed. Commands for a closed target
+    /// must fail (`-32001`) instead of falling back to the default session.
+    closed: StdMutex<HashSet<String>>,
+}
+
+impl Default for TargetRegistry {
+    fn default() -> Self {
+        Self {
+            by_session: RwLock::new(HashMap::new()),
+            closed: StdMutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl TargetRegistry {
+    /// Whether the target for this sessionId has been closed.
+    pub fn is_closed(&self, session_id: &str) -> bool {
+        self.closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+    }
+
+    /// Record a sessionId as closed (tombstone for routing).
+    fn mark_closed(&self, session_id: &str) {
+        self.closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string());
+    }
+}
+
+impl TargetRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clone the entry for a sessionId, if registered.
+    pub async fn get(&self, session_id: &str) -> Option<TargetEntry> {
+        self.by_session.read().await.get(session_id).cloned()
+    }
+
+    /// Clone the child session for a sessionId, if registered.
+    pub async fn session(&self, session_id: &str) -> Option<Arc<RwLock<Session>>> {
+        self.by_session
+            .read()
+            .await
+            .get(session_id)
+            .map(|e| e.session.clone())
+    }
+
+    /// Register a child target under a sessionId.
+    pub async fn insert(&self, session_id: String, entry: TargetEntry) {
+        self.by_session.write().await.insert(session_id, entry);
+    }
+
+    /// Remove and return the entry whose targetId matches, as `(sessionId, entry)`.
+    /// The sessionId is tombstoned so later commands for it fail loudly.
+    pub async fn close_by_target(&self, target_id: &str) -> Option<(String, TargetEntry)> {
+        let mut map = self.by_session.write().await;
+        let sid = map
+            .iter()
+            .find(|(_, e)| e.target_id == target_id)
+            .map(|(sid, _)| sid.clone())?;
+        self.mark_closed(&sid);
+        map.remove(&sid).map(|e| (sid, e))
+    }
+
+    /// Remove and return the entry for a sessionId (used by `detachFromTarget`).
+    pub async fn detach(&self, session_id: &str) -> Option<TargetEntry> {
+        self.remove_by_session(session_id).await
+    }
+
+    /// Remove and return the entry for a sessionId.
+    pub async fn remove_by_session(&self, session_id: &str) -> Option<TargetEntry> {
+        self.by_session.write().await.remove(session_id)
+    }
+
+    /// Snapshot of all registered entries as `(sessionId, entry)`.
+    pub async fn entries(&self) -> Vec<(String, TargetEntry)> {
+        self.by_session
+            .read()
+            .await
+            .iter()
+            .map(|(sid, e)| (sid.clone(), e.clone()))
+            .collect()
+    }
+}
+
+/// Shared handle to the child-target registry.
+pub type ChildTargets = Arc<TargetRegistry>;
 
 /// Context passed to all domain handlers.
 ///
@@ -72,7 +177,7 @@ pub async fn dispatch(method: &str, params: Option<Value>, ctx: &DispatchContext
     match domain {
         "Browser" => browser::handle(method_name, params),
         "DOM" => dom::handle(method_name, params, ctx).await,
-        "Emulation" => emulation::handle(method_name, params),
+        "Emulation" => emulation::handle(method_name, params, ctx).await,
         "Fetch" => fetch::handle(method_name, params, ctx).await,
         "Input" => input::handle(method_name, params, ctx).await,
         "Network" => network::handle(method_name, params, ctx).await,

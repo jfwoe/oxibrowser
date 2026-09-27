@@ -16,8 +16,12 @@ use std::io::BufRead;
 use tab_manager::TabManager;
 
 /// Run the session REPL. Returns exit code.
-pub async fn run_session() -> i32 {
-    let config = oxibrowser_core::BrowserConfig::headless();
+pub async fn run_session(allow_private_ips: bool) -> i32 {
+    let mut config = oxibrowser_core::BrowserConfig::headless();
+    if allow_private_ips {
+        config.enable_ssrf_filter = false;
+        eprintln!("⚠ SSRF filter disabled: private/internal IP ranges accessible.");
+    }
     let browser = match oxibrowser_core::Browser::new(config).await {
         Ok(b) => b,
         Err(e) => {

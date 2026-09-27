@@ -20,8 +20,8 @@ No Chromium, no V8. Single static binary (C toolchain needed for TLS backend bui
 |-------|------|
 | `oxibrowser` | CLI binary: `fetch`, `extract`, `run`, `session`, `serve`, `describe`, `skill`, `version` |
 | `oxibrowser-core` | Engine: Browser→Session→Page→Frame, JS runtime, CSS rendering, network |
-| `oxibrowser-cdp` | CDP server: WebSocket + 10 domain handlers |
-| `oxibrowser-webapi` | DOM: Document, Node, Tree |
+| `oxibrowser-cdp` | CDP server: WebSocket + 12 domain handlers |
+| `oxibrowser-render` | Rendering: Blitz DOM + Stylo CSS + Taffy layout, vello_cpu raster, parley fonts |
 
 ## WHY
 
@@ -54,7 +54,8 @@ cargo run -- session                 # Start interactive JSON REPL
 | Add a CDP command | `crates/oxibrowser-cdp/src/domains/mod.rs` → add domain file |
 | Add a JS Web API | `crates/oxibrowser-core/src/js/runtime.rs` → `create_context()` |
 | Add DOM operation | `crates/oxibrowser-core/src/js/dom_snapshot.rs` → `DomSnapshot` + `DomMutation` |
-| Add network feature | `crates/oxibrowser-core/src/network/` |
+| Add a network feature | `crates/oxibrowser-core/src/network/` |
+| Add secret redaction / audit surface | `crates/oxibrowser-core/src/security/` (`redact.rs`, `audit.rs`) |
 | Add CSS rendering | `crates/oxibrowser-core/src/css/` |
 
 ### Architecture at a Glance

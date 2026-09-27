@@ -556,6 +556,38 @@ impl Tab {
         Ok(Self::extract_result(&session))
     }
 
+    /// Export the recorded network log as a HAR 1.2 JSON document.
+    ///
+    /// Read-only delegation to [`Session::network_log_har`]. Returns the HAR
+    /// `{"log": {…}}` envelope (empty `entries` when nothing was recorded).
+    pub async fn network_log_har_json(&self) -> Result<serde_json::Value> {
+        let session = self.inner.lock().await;
+        Ok(session.network_log_har())
+    }
+
+    /// Raw (unredacted) HAR view — `--har-raw` only. See
+    /// [`Session::network_log_har_raw`] for the hazard.
+    pub async fn network_log_har_raw_json(&self) -> Result<serde_json::Value> {
+        let session = self.inner.lock().await;
+        Ok(session.network_log_har_raw())
+    }
+
+    /// Interactive elements (links, buttons, inputs) of the live DOM as JSON.
+    ///
+    /// Read-only view: serializes the live (post-JS) [`crate::js::dom_snapshot::DomSnapshot`]'s
+    /// `interactive_elements()` output. The shape matches the
+    /// `OXI.getInteractiveElements` wire format (camelCase) because
+    /// `InteractiveElement` derives `Serialize`. Returns `[]` when no page
+    /// is loaded.
+    pub async fn interactive_elements_json(&self) -> Result<serde_json::Value> {
+        let mut session = self.inner.lock().await;
+        let Some(snapshot) = session.dom_snapshot().await? else {
+            return Ok(serde_json::json!([]));
+        };
+        let elements = snapshot.interactive_elements();
+        Ok(serde_json::to_value(elements).unwrap_or_else(|_| serde_json::json!([])))
+    }
+
     /// Get text content of all elements matching a CSS selector.
     pub async fn query_all(&self, selector: &str) -> Result<Vec<String>> {
         let mut session = self.inner.lock().await;
@@ -814,7 +846,8 @@ impl Tab {
     // Screenshot
     // -----------------------------------------------------------------------
 
-    /// Render the current page as a PNG screenshot (text-based bitmap font).
+    /// Render the current page as a PNG via the live `RenderDocument`
+    /// (Blitz + Stylo layout, vello_cpu raster, real fonts).
     pub async fn screenshot(&self, width: u32) -> Result<Vec<u8>> {
         let started = std::time::Instant::now();
         let mut session = self.inner.lock().await;
@@ -874,6 +907,47 @@ impl Tab {
             Ok(session) => session.is_closed(),
             Err(_) => false, // locked ⇒ still alive
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Storage state
+    // -----------------------------------------------------------------------
+
+    /// Export this tab's storage state (cookies + per-origin localStorage)
+    /// as Playwright-compatible JSON.
+    ///
+    /// Thin wrapper over [`Session::export_state`] that serializes the
+    /// snapshot for consumers that deal in raw JSON (e.g. the session REPL's
+    /// `save-state` command).
+    pub async fn export_storage_state(&self) -> Result<Value> {
+        let session = self.inner.lock().await;
+        let state = session.export_state();
+        tracing::debug!(
+            tab_id = %self.tab_id,
+            cookies = state.cookies.len(),
+            origins = state.origins.len(),
+            "export_storage_state"
+        );
+        serde_json::to_value(state)
+            .map_err(|e| CoreError::SessionError(format!("serialize storage state: {e}")))
+    }
+
+    /// Import storage state from JSON (cookies + per-origin localStorage),
+    /// merging into this tab's cookie jar and stashing localStorage seeds.
+    ///
+    /// Thin wrapper over [`Session::import_state`] that validates the JSON
+    /// shape (`cookies` / `origins[].localStorage`) before applying it.
+    pub async fn import_storage_state(&self, state: Value) -> Result<()> {
+        let st: crate::storage_state::StorageState = serde_json::from_value(state)
+            .map_err(|e| CoreError::SessionError(format!("invalid storage state: {e}")))?;
+        tracing::debug!(
+            tab_id = %self.tab_id,
+            cookies = st.cookies.len(),
+            origins = st.origins.len(),
+            "import_storage_state"
+        );
+        let mut session = self.inner.lock().await;
+        session.import_state(&st)
     }
 
     // -----------------------------------------------------------------------

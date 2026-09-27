@@ -1,7 +1,7 @@
 //! CDP Runtime domain handler.
 //!
 //! Handles Runtime.enable, Runtime.disable, Runtime.evaluate,
-//! Runtime.callFunctionOn, Runtime.getProperties.
+//! Runtime.callFunctionOn, Runtime.runScript, Runtime.getProperties.
 //!
 //! After Runtime.enable, emits Runtime.executionContextCreated.
 //! Runtime.evaluate delegates to boa_engine via Session::evaluate_js().
@@ -19,11 +19,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "evaluate" => evaluate(params, ctx).await,
         "callFunctionOn" => call_function_on(params, ctx).await,
         "getProperties" => get_properties(params),
-        "compileScript" => Ok(Some(json!({ "scriptId": "", "exceptionDetails": null }))),
-        "runScript" => Ok(Some(json!({
-            "result": { "type": "undefined" },
-            "exceptionDetails": null
-        }))),
+        "runScript" => run_script(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
             message: format!("Runtime.{} not implemented", method),
@@ -177,6 +173,23 @@ async fn evaluate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
             }
         }))),
     }
+}
+
+/// Runtime.runScript — run a script and return its result.
+///
+/// Persistent script storage is not supported (`Runtime.compileScript` is
+/// not implemented, so there is no `scriptId` to run); the caller-supplied
+/// `script` source is therefore evaluated like `Runtime.evaluate` (without
+/// `awaitPromise`), producing the identical response shape.
+async fn run_script(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let expression = params
+        .and_then(|p| p.get("script").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    evaluate(
+        Some(json!({ "expression": expression, "returnByValue": true })),
+        ctx,
+    )
+    .await
 }
 
 /// Runtime.callFunctionOn — calls a function on a remote object.

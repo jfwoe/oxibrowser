@@ -355,6 +355,11 @@ impl DomSnapshot {
         // Element text_content = concatenation of descendant text (mirrors
         // `collect_text_content` in the retired `from_frame` path).
         fill_element_text(&mut nodes, root as u32);
+        // Security: password input values must not survive into any snapshot
+        // reader (OXI.getInteractiveElements, HTML serialization, extract).
+        // Fill uses selectors + explicit values and never reads the snapshot,
+        // so masking here is observation-only.
+        mask_password_inputs(&mut nodes);
 
         let (id_index, class_index, tag_index) = build_indices(&nodes, &order);
         Self {
@@ -1597,6 +1602,31 @@ fn set_element_text_recursive(nodes: &mut HashMap<u32, DomNode>, id: u32) -> Str
 
 // ── HTML serialization (for compose-then-feed screenshot rasterization) ────
 
+/// True when `node` is an `<input type="password">` element.
+pub(crate) fn is_password_input(node: &DomNode) -> bool {
+    node.node_type == 1
+        && node.tag.eq_ignore_ascii_case("input")
+        && node
+            .attributes
+            .get("type")
+            .map(|t| t.trim().eq_ignore_ascii_case("password"))
+            .unwrap_or(false)
+}
+
+/// Replace `value` attributes of password inputs with the fixed redaction
+/// marker. The snapshot is a read-only observation, so this never affects
+/// the live document or form filling — only what snapshot readers see.
+fn mask_password_inputs(nodes: &mut HashMap<u32, DomNode>) {
+    for node in nodes.values_mut() {
+        if is_password_input(node) && node.attributes.contains_key("value") {
+            node.attributes.insert(
+                "value".to_string(),
+                crate::security::redact::REDACTED.to_string(),
+            );
+        }
+    }
+}
+
 /// Serialize a single node (and its subtree) into `out` as HTML.
 fn serialize_node(nodes: &HashMap<u32, DomNode>, id: u32, out: &mut String) {
     let Some(node) = nodes.get(&id) else {
@@ -1827,6 +1857,11 @@ pub struct InteractiveElement {
     #[serde(rename = "inputType")]
     pub input_type: Option<String>,
     /// `name` attribute, when present and non-empty.
+    #[serde(rename = "nameAttr")]
+    pub name_attr: Option<String>,
+    /// Computed accessible name (aria-labelledby → aria-label → img alt →
+    /// placeholder → value → text), trimmed and capped at
+    /// [`MAX_INTERACTIVE_TEXT_CHARS`]. `None` when no non-empty name exists.
     pub name: Option<String>,
     /// `aria-label` attribute, when present and non-empty.
     #[serde(rename = "ariaLabel")]
@@ -1839,6 +1874,16 @@ pub struct InteractiveElement {
     /// identifiers, otherwise `[id="…"]`; plus `tag` /
     /// `tag:nth-of-type(n)` steps joined by `" > "`).
     pub selector: String,
+}
+
+/// Trims a candidate accessible name and caps it at
+/// [`MAX_INTERACTIVE_TEXT_CHARS`]; empty results become `None`.
+fn cap_accessible_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_INTERACTIVE_TEXT_CHARS).collect())
 }
 
 /// Tags that are interactive regardless of attributes.
@@ -1909,15 +1954,113 @@ pub fn compute_interactive_role(node: &DomNode) -> String {
 }
 
 impl DomSnapshot {
+    /// Computed accessible name for `node_id`, following a simplified
+    /// name-from-author precedence: `aria-labelledby` (space-separated id
+    /// references resolved against the document) → `aria-label` → `alt` on
+    /// `<img>` → `placeholder` on form controls → `value` → descendant text.
+    /// Whitespace-trimmed and capped at [`MAX_INTERACTIVE_TEXT_CHARS`];
+    /// `None` when no non-empty candidate exists.
+    pub fn accessible_name(&self, node_id: u32) -> Option<String> {
+        self.accessible_name_with_id_map(node_id, &self.element_id_map())
+    }
+
+    /// Maps non-empty `id` attribute values to node ids (single DFS over the
+    /// body subtree) so `aria-labelledby` resolution is O(1) per reference.
+    fn element_id_map(&self) -> HashMap<String, u32> {
+        let mut map = HashMap::new();
+        let mut stack = vec![self.root_id];
+        while let Some(id) = stack.pop() {
+            if let Some(node) = self.nodes.get(&id) {
+                if node.node_type == 1
+                    && let Some(id_attr) = node
+                        .attributes
+                        .get("id")
+                        .map(|v| v.trim())
+                        .filter(|v| !v.is_empty())
+                {
+                    map.entry(id_attr.to_string()).or_insert(node.id);
+                }
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+        map
+    }
+
+    /// [`DomSnapshot::accessible_name`] with a prebuilt id map
+    /// (see [`DomSnapshot::element_id_map`]).
+    fn accessible_name_with_id_map(
+        &self,
+        node_id: u32,
+        id_map: &HashMap<String, u32>,
+    ) -> Option<String> {
+        let node = self.nodes.get(&node_id)?;
+        let attr = |name: &str| {
+            node.attributes
+                .get(name)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+        };
+        // 1. aria-labelledby: space-separated id references, texts joined.
+        if let Some(refs) = attr("aria-labelledby") {
+            let joined = refs
+                .split_whitespace()
+                .filter_map(|id| id_map.get(id).copied())
+                .map(|target| self.deep_text_content(target))
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(name) = cap_accessible_name(&joined) {
+                return Some(name);
+            }
+        }
+        // 2. aria-label.
+        if let Some(label) = attr("aria-label")
+            && let Some(name) = cap_accessible_name(label)
+        {
+            return Some(name);
+        }
+        // 3. img alt.
+        if node.tag.eq_ignore_ascii_case("img")
+            && let Some(alt) = attr("alt")
+            && let Some(name) = cap_accessible_name(alt)
+        {
+            return Some(name);
+        }
+        // 4. placeholder on form controls.
+        if matches!(
+            node.tag.to_lowercase().as_str(),
+            "input" | "select" | "textarea"
+        ) && let Some(placeholder) = attr("placeholder")
+            && let Some(name) = cap_accessible_name(placeholder)
+        {
+            return Some(name);
+        }
+        // 5. value. Skipped for password inputs: a typed/autofilled password
+        // must never surface through the accessible name (security: see
+        // docs/designs/2026-09-27-agent-auth-implementation.md §7 P0-2).
+        if let Some(value) = attr("value")
+            && !is_password_input(node)
+            && let Some(name) = cap_accessible_name(value)
+        {
+            return Some(name);
+        }
+        // 6. descendant text.
+        cap_accessible_name(&self.deep_text_content(node_id))
+    }
+
     /// All interactive elements in document order (iterative DFS pre-order,
     /// same traversal as `headings`/`links`).
     pub fn interactive_elements(&self) -> Vec<InteractiveElement> {
+        let id_map = self.element_id_map();
         let mut result: Vec<InteractiveElement> = Vec::new();
         let mut stack = vec![self.root_id];
         while let Some(id) = stack.pop() {
             if let Some(node) = self.nodes.get(&id) {
                 if node.node_type == 1 && is_interactive_element(node) {
-                    let element = self.build_interactive_element(node, result.len());
+                    let element = self.build_interactive_element(node, result.len(), &id_map);
                     result.push(element);
                 }
                 for &child in node.children.iter().rev() {
@@ -1928,7 +2071,12 @@ impl DomSnapshot {
         result
     }
 
-    fn build_interactive_element(&self, node: &DomNode, index: usize) -> InteractiveElement {
+    fn build_interactive_element(
+        &self,
+        node: &DomNode,
+        index: usize,
+        id_map: &HashMap<String, u32>,
+    ) -> InteractiveElement {
         let full_text = self.deep_text_content(node.id);
         let text: String = full_text.chars().take(MAX_INTERACTIVE_TEXT_CHARS).collect();
         let attr = |name: &str| {
@@ -1945,9 +2093,10 @@ impl DomSnapshot {
             text,
             href: attr("href"),
             input_type: attr("type"),
-            name: attr("name"),
+            name_attr: attr("name"),
             aria_label: attr("aria-label"),
             placeholder: attr("placeholder"),
+            name: self.accessible_name_with_id_map(node.id, id_map),
             disabled: node.attributes.contains_key("disabled"),
             selector: self.css_selector_path(node.id),
         }
@@ -2042,6 +2191,163 @@ fn escape_css_attr_value(value: &str) -> String {
         }
     }
     out
+}
+
+// ── Stable refs + ARIA snapshot support (OXI domain) ────────────────────────
+
+impl DomSnapshot {
+    /// Content fingerprint for stable-ref (`OXI.*Ref`) validation.
+    ///
+    /// Combines the tag, sorted `key=value` attributes, and the first 80
+    /// characters of deep text — enough to detect attribute or content drift
+    /// between observation and use. The exact format is an implementation
+    /// detail; callers only compare fingerprints for equality.
+    pub fn fingerprint(&self, node_id: u32) -> String {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return String::new();
+        };
+        let mut attrs: Vec<String> = node
+            .attributes
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        attrs.sort();
+        let text: String = self.deep_text_content(node_id).chars().take(80).collect();
+        format!("{}|{}|{}", node.tag.to_lowercase(), attrs.join(","), text)
+    }
+
+    /// ARIA role for ARIA-snapshot rendering: explicit `role` attribute wins,
+    /// then landmark tag mappings (`img`→img, `nav`→navigation, `header`→
+    /// banner, `footer`→contentinfo, `main`→main, `aside`→complementary),
+    /// then the implicit interactive roles of [`compute_interactive_role`]
+    /// (`a`/`button`/`input`/`select`/`textarea`), falling back to `generic`
+    /// (Playwright-style). Non-element nodes render as `text`.
+    pub fn aria_role(&self, node_id: u32) -> String {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return "generic".into();
+        };
+        if node.node_type != 1 {
+            return "text".into();
+        }
+        if let Some(role) = node.attributes.get("role") {
+            let role = role.trim();
+            if !role.is_empty() {
+                return role.to_string();
+            }
+        }
+        match node.tag.to_lowercase().as_str() {
+            "img" => "img".into(),
+            "nav" => "navigation".into(),
+            "header" => "banner".into(),
+            "footer" => "contentinfo".into(),
+            "main" => "main".into(),
+            "aside" => "complementary".into(),
+            "a" | "button" | "input" | "select" | "textarea" => compute_interactive_role(node),
+            _ => "generic".into(),
+        }
+    }
+
+    /// Whether the node is visible per the CSS `LayoutEngine`
+    /// (`display: none`, `visibility: hidden`/`collapse`, and `opacity: 0`
+    /// all hide it). Unknown nodes are invisible.
+    pub fn is_visible(&self, node_id: u32) -> bool {
+        crate::css::LayoutEngine::compute_style(self, node_id).is_some_and(|s| s.visible)
+    }
+
+    /// Render the visible tree as a Playwright-style YAML ARIA snapshot:
+    ///
+    /// ```text
+    /// - button "Submit" [ref=e5]
+    /// - navigation:
+    ///   - link "Home" [ref=e3]
+    /// ```
+    ///
+    /// `allocate_ref` decides which elements carry a `[ref=eN]` marker and
+    /// owns the ref bookkeeping; returning `None` omits the marker. Invisible
+    /// nodes and non-rendered tags (`script`/`style`/`head`) are skipped; the
+    /// document/`html`/`body` wrappers are not rendered — their children start
+    /// at depth 0. Leaf lines carry the accessible name; container lines end
+    /// with `:`; checkboxes with a `checked` attribute gain `[checked]`.
+    pub fn render_aria_yaml(&self, allocate_ref: &mut dyn FnMut(u32) -> Option<String>) -> String {
+        let start = self.body_id.unwrap_or(self.root_id);
+        let mut out = String::new();
+        for child in self.aria_yaml_children(start) {
+            self.render_aria_yaml_node(child, 0, allocate_ref, &mut out);
+        }
+        out
+    }
+
+    /// Element children of `id` that the ARIA snapshot would render.
+    fn aria_yaml_children(&self, id: u32) -> Vec<u32> {
+        match self.nodes.get(&id) {
+            Some(node) => node
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.aria_yaml_renders(c))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether `id` appears in the ARIA snapshot: element nodes only,
+    /// skipping `script`/`style`/`head`, and visible per
+    /// [`DomSnapshot::is_visible`].
+    fn aria_yaml_renders(&self, id: u32) -> bool {
+        let Some(node) = self.nodes.get(&id) else {
+            return false;
+        };
+        if node.node_type != 1 {
+            return false;
+        }
+        if matches!(
+            node.tag.to_lowercase().as_str(),
+            "script" | "style" | "head"
+        ) {
+            return false;
+        }
+        self.is_visible(id)
+    }
+
+    fn render_aria_yaml_node(
+        &self,
+        id: u32,
+        depth: usize,
+        allocate_ref: &mut dyn FnMut(u32) -> Option<String>,
+        out: &mut String,
+    ) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let role = self.aria_role(id);
+        let r#ref = allocate_ref(id);
+        let children = self.aria_yaml_children(id);
+
+        let mut line = format!("{}- {}", "  ".repeat(depth), role);
+        if children.is_empty() {
+            // Leaf: `- role "accessible name" …` (containers stay unnamed).
+            if let Some(name) = self.accessible_name(id) {
+                line.push_str(&format!(" \"{name}\""));
+            }
+        }
+        if node.tag.eq_ignore_ascii_case("input")
+            && node.attributes.get("type").map(|t| t.trim()) == Some("checkbox")
+            && node.attributes.contains_key("checked")
+        {
+            line.push_str(" [checked]");
+        }
+        if let Some(r) = r#ref {
+            line.push_str(&format!(" [ref={r}]"));
+        }
+        if !children.is_empty() {
+            line.push(':');
+        }
+        out.push_str(&line);
+        out.push('\n');
+        for child in children {
+            self.render_aria_yaml_node(child, depth + 1, allocate_ref, out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2435,6 +2741,53 @@ mod tests {
     // ── OXI.getInteractiveElements ──────────────────────────────────────────
 
     #[test]
+    fn test_password_input_values_masked_in_snapshot() {
+        let snapshot = parse_html_fragment_to_snapshot(
+            r#"<html><body>
+                <input type="password" value="hunter2" name="pw">
+                <input type="text" value="typed" name="q">
+            </body></html>"#,
+        );
+        let pw = snapshot.query_selector("input[type=password]").unwrap();
+        let text = snapshot.query_selector("input[type=text]").unwrap();
+        assert_eq!(
+            snapshot.nodes[&pw]
+                .attributes
+                .get("value")
+                .map(String::as_str),
+            Some(crate::security::redact::REDACTED),
+            "password value must not survive into the snapshot"
+        );
+        assert_eq!(
+            snapshot.nodes[&text]
+                .attributes
+                .get("value")
+                .map(String::as_str),
+            Some("typed"),
+            "non-password values are preserved"
+        );
+        // Accessible-name value fallback must not surface password values.
+        assert_eq!(snapshot.accessible_name(pw), None);
+        assert_eq!(snapshot.accessible_name(text), Some("typed".into()));
+        // HTML serialization (screenshot raster feed) carries the marker too.
+        let html = snapshot.to_html();
+        assert!(!html.contains("hunter2"), "{html}");
+        assert!(html.contains(crate::security::redact::REDACTED), "{html}");
+    }
+
+    #[test]
+    fn test_password_input_without_value_has_no_marker_noise() {
+        let snapshot = parse_html_fragment_to_snapshot(
+            r#"<html><body><input type="password" name="pw"></body></html>"#,
+        );
+        let pw = snapshot.query_selector("input").unwrap();
+        assert!(
+            !snapshot.nodes[&pw].attributes.contains_key("value"),
+            "no value attribute in, no marker injected"
+        );
+    }
+
+    #[test]
     fn test_interactive_elements_by_tag() {
         let html = r#"<html><body>
             <a href="/l">link text</a>
@@ -2460,18 +2813,128 @@ mod tests {
 
         assert_eq!(els[2].tag, "input");
         assert_eq!(els[2].input_type.as_deref(), Some("text"));
-        assert_eq!(els[2].name.as_deref(), Some("q"));
+        assert_eq!(els[2].name_attr.as_deref(), Some("q"));
         assert_eq!(els[2].placeholder.as_deref(), Some("search"));
         assert_eq!(els[2].aria_label.as_deref(), Some("query"));
+        assert_eq!(els[2].name.as_deref(), Some("query"), "aria-label wins");
         assert!(!els[2].disabled);
 
         assert_eq!(els[3].tag, "select");
         assert_eq!(els[3].role, "listbox");
-        assert_eq!(els[3].name.as_deref(), Some("s"));
+        assert_eq!(els[3].name_attr.as_deref(), Some("s"));
 
         assert_eq!(els[4].tag, "textarea");
         assert_eq!(els[4].role, "textbox");
         assert!(els[4].text.is_empty(), "empty textarea has no text");
+    }
+
+    #[test]
+    fn test_accessible_name_priority() {
+        // 1. aria-labelledby beats aria-label.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body>
+                <span id="lbl">full label</span>
+                <button aria-labelledby="lbl" aria-label="short">text</button>
+            </body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("button").unwrap()),
+            Some("full label".into())
+        );
+
+        // 1b. multiple labelledby ids join with spaces; unknown ids skipped.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body>
+                <span id="a">first</span>
+                <span id="b">second</span>
+                <button aria-labelledby="a missing b">text</button>
+            </body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("button").unwrap()),
+            Some("first second".into())
+        );
+
+        // 2. aria-label beats img alt / placeholder / text.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body>
+                <img alt="photo" role="button" aria-label="close">
+            </body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("img").unwrap()),
+            Some("close".into())
+        );
+
+        // 3. img alt beats text (none here) and placeholder.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><img alt="photo" role="button"></body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("img").unwrap()),
+            Some("photo".into())
+        );
+
+        // 4. input placeholder beats value and name attribute.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body>
+                <input value="typed" name="q" placeholder="search here">
+            </body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("input").unwrap()),
+            Some("search here".into())
+        );
+
+        // 5. value beats text when no placeholder.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><input value="typed"></body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("input").unwrap()),
+            Some("typed".into())
+        );
+
+        // 6. descendant text is the final fallback.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><button><span>click </span>me</button></body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("button").unwrap()),
+            Some("click  me".into()), // deep text joins text nodes with spaces
+        );
+
+        // Empty/whitespace candidates collapse to None.
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><button>   </button></body></html>"#,
+        ));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("button").unwrap()),
+            None
+        );
+
+        // 80-char cap.
+        let long = "x".repeat(120);
+        let snapshot = DomSnapshot::from_frame(&make_frame(&format!(
+            r#"<html><body><button>{long}</button></body></html>"#
+        )));
+        assert_eq!(
+            snapshot.accessible_name(snapshot.query_selector("button").unwrap()),
+            Some("x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn test_interactive_element_name_on_wire() {
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><button name="b" aria-label="go">text</button></body></html>"#,
+        ));
+        let el = &snapshot.interactive_elements()[0];
+        assert_eq!(el.name.as_deref(), Some("go"));
+        assert_eq!(el.name_attr.as_deref(), Some("b"));
+        let json = serde_json::to_value(el).unwrap();
+        assert_eq!(json["name"], "go");
+        assert_eq!(json["nameAttr"], "b");
     }
 
     #[test]
@@ -2626,6 +3089,112 @@ mod tests {
         assert!(
             els[0].text.starts_with("xxxx"),
             "text is the visible prefix"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_consistency() {
+        let html = r#"<html><body><button id="b">Hit</button></body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+        let button = snapshot.query_selector("button").unwrap();
+        let orig = snapshot.fingerprint(button);
+
+        // Deterministic within a snapshot.
+        assert_eq!(orig, snapshot.fingerprint(button));
+
+        // Deterministic across independent rebuilds of identical content.
+        let again = DomSnapshot::from_frame(&make_frame(html));
+        assert_eq!(
+            orig,
+            again.fingerprint(again.query_selector("button").unwrap())
+        );
+
+        // Attribute drift changes the fingerprint.
+        let attr_changed = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><button id="b" data-x="1">Hit</button></body></html>"#,
+        ));
+        assert_ne!(
+            orig,
+            attr_changed.fingerprint(attr_changed.query_selector("button").unwrap())
+        );
+
+        // Text drift changes the fingerprint.
+        let text_changed = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body><button id="b">Hit Me</button></body></html>"#,
+        ));
+        assert_ne!(
+            orig,
+            text_changed.fingerprint(text_changed.query_selector("button").unwrap())
+        );
+
+        // Missing nodes fingerprint to the empty string.
+        assert_eq!(snapshot.fingerprint(999_999), "");
+    }
+
+    #[test]
+    fn test_aria_role_priority() {
+        let snapshot = DomSnapshot::from_frame(&make_frame(
+            r#"<html><body>
+                <div role="button" id="explicit">X</div>
+                <nav id="site"></nav>
+                <header id="top"></header>
+                <footer id="bottom"></footer>
+                <main id="content"></main>
+                <aside id="side"></aside>
+                <img src="x.png" alt="Logo">
+                <a href="/">Home</a>
+                <input type="checkbox">
+                <select></select>
+                <textarea></textarea>
+                <div id="plain"></div>
+            </body></html>"#,
+        ));
+        let role = |sel: &str| snapshot.aria_role(snapshot.query_selector(sel).unwrap());
+        // Explicit `role` attribute wins over everything.
+        assert_eq!(role("#explicit"), "button");
+        // Landmark tag mappings.
+        assert_eq!(role("#site"), "navigation");
+        assert_eq!(role("#top"), "banner");
+        assert_eq!(role("#bottom"), "contentinfo");
+        assert_eq!(role("#content"), "main");
+        assert_eq!(role("#side"), "complementary");
+        // Interactive implicit roles (compute_interactive_role reuse).
+        assert_eq!(role("img"), "img");
+        assert_eq!(role("a"), "link");
+        assert_eq!(role("input"), "checkbox");
+        assert_eq!(role("select"), "listbox");
+        assert_eq!(role("textarea"), "textbox");
+        // Fallback for plain containers.
+        assert_eq!(role("#plain"), "generic");
+    }
+
+    #[test]
+    fn test_render_aria_yaml_golden() {
+        let html = r#"<html><head><title>Golden</title></head>
+            <body>
+                <nav><a href="/">Home</a></nav>
+                <button>Submit</button>
+                <input type="checkbox" checked aria-label="Accept">
+            </body></html>"#;
+        let snapshot = DomSnapshot::from_frame(&make_frame(html));
+
+        let mut next = 1u64;
+        let yaml = snapshot.render_aria_yaml(&mut |node_id| {
+            let node = snapshot.nodes.get(&node_id)?;
+            if !is_interactive_element(node) {
+                return None;
+            }
+            let r = format!("e{next}");
+            next += 1;
+            Some(r)
+        });
+
+        assert_eq!(
+            yaml,
+            "- navigation:\n\
+             \x20 - link \"Home\" [ref=e1]\n\
+             - button \"Submit\" [ref=e2]\n\
+             - checkbox \"Accept\" [checked] [ref=e3]\n"
         );
     }
 }

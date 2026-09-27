@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 license = "MIT"
 authors = ["project-oxi contributors"]
@@ -44,6 +44,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 sha1 = "0.10"
+sha2 = "0.11"
 md-5 = "0.10"
 base64 = "0.22"
 boa_engine = "0.20"
@@ -65,7 +66,7 @@ peniko = "0.6"
 png = "0.18"
 
 [workspace.metadata.release]
-version = "0.22.0"
+version = "0.23.0"
 
 [profile.release]
 strip = true

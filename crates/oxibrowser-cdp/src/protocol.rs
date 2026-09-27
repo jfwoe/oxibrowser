@@ -87,12 +87,13 @@ pub struct JsonVersion {
 
 impl JsonVersion {
     pub fn new(ws_url: String) -> Self {
+        let product = format!("OxiBrowser/{}", env!("CARGO_PKG_VERSION"));
         Self {
-            browser: "OxiBrowser/0.1.0".into(),
+            browser: product.clone(),
             protocol_version: "1.3".into(),
-            user_agent: "OxiBrowser/0.1.0".into(),
-            v8_version: "0.1.0".into(),
-            webkit_version: "0.1.0".into(),
+            user_agent: product.clone(),
+            v8_version: product.clone(),
+            webkit_version: product,
             web_socket_url: ws_url,
         }
     }
@@ -174,7 +175,12 @@ mod tests {
         );
         // Verify round-trip
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["browser"], "OxiBrowser/0.1.0");
+        assert!(
+            parsed["browser"]
+                .as_str()
+                .unwrap()
+                .starts_with("OxiBrowser/")
+        );
         assert_eq!(parsed["protocolVersion"], "1.3");
     }
 }

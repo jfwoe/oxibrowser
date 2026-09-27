@@ -2,16 +2,18 @@
 //!
 //! Human is the default. `--json` opts into machine-readable output.
 //!
-//! 8 subcommands: fetch, extract, run, session, serve, search, describe, skill, version
+//! 9 subcommands: fetch, extract, run, session, serve, search, describe, skill, version
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
 mod describe;
+mod mcp;
 mod output;
 mod session;
 mod skill;
@@ -30,6 +32,17 @@ use oxibrowser::search;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Audit log location (default `~/.oxibrowser/audit.jsonl`).
+    #[arg(long, global = true, value_name = "PATH")]
+    audit: Option<PathBuf>,
+    /// Disable the audit log entirely.
+    #[arg(long, global = true)]
+    no_audit: bool,
+    /// Additional sensitive header names to redact (repeatable), for
+    /// organization-specific auth headers the default list does not cover.
+    /// Applies to `--har` output and CDP network event URLs.
+    #[arg(long = "redact-header", global = true, value_name = "NAME")]
+    redact_headers: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -80,6 +93,23 @@ enum Commands {
         /// Print HTTP headers to stderr.
         #[arg(long)]
         headers: bool,
+        /// Write the recorded network log as HAR JSON to PATH.
+        #[arg(long, value_name = "PATH")]
+        har: Option<PathBuf>,
+        /// Write the HAR WITHOUT secret redaction. The file will contain
+        /// cookies, bearer tokens, and POST bodies verbatim. Warns and
+        /// audit-logs; use only for throwaway debugging.
+        #[arg(long)]
+        har_raw: bool,
+        /// Allow navigation to private/internal IP ranges (disables SSRF filter).
+        /// Use for local development only.
+        #[arg(long)]
+        allow_private_ips: bool,
+        /// Count unsupported/polyfilled Web API accesses while fetching.
+        /// Adds `meta.api_gaps` to `--json` output; over CDP, query with
+        /// `OXI.getApiGaps`.
+        #[arg(long)]
+        telemetry: bool,
         /// Timeout in seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -134,9 +164,17 @@ enum Commands {
     },
 
     /// Start interactive session (stdin/stdout JSON REPL).
-    Session,
+    Session {
+        /// Allow navigation to private/internal IP ranges (disables SSRF filter).
+        /// Use for local development only.
+        #[arg(long)]
+        allow_private_ips: bool,
+    },
 
     /// Start CDP server for Puppeteer/Playwright.
+    ///
+    /// With `--mcp`, run as a stdio MCP server (newline-delimited JSON-RPC
+    /// 2.0) instead of a CDP listener; host/port/auth-token are ignored.
     Serve {
         /// Host to bind to.
         #[arg(long, default_value = "127.0.0.1")]
@@ -160,6 +198,10 @@ enum Commands {
         /// Clients connect with ws://host:port/ws?token=<TOKEN>.
         #[arg(long)]
         auth_token: Option<String>,
+        /// Serve as a stdio MCP server (JSON-RPC 2.0 on stdin/stdout)
+        /// instead of a CDP listener.
+        #[arg(long)]
+        mcp: bool,
     },
 
     /// Print CLI schema as JSON (for agents).
@@ -240,6 +282,18 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Audit log: default path unless `--audit PATH`; `--no-audit` disables.
+    oxibrowser_core::security::audit::init(if cli.no_audit {
+        None
+    } else {
+        Some(cli.audit.clone())
+    });
+
+    // Organization-specific redaction headers (global `--redact-header`).
+    if !cli.redact_headers.is_empty() {
+        oxibrowser_core::security::redact::set_extra_sensitive_headers(cli.redact_headers.clone());
+    }
+
     let exit_code = match cli.command {
         Commands::Fetch {
             url,
@@ -257,6 +311,10 @@ async fn main() {
             extract,
             all,
             headers,
+            har,
+            har_raw,
+            allow_private_ips,
+            telemetry,
             timeout,
         } => {
             run_fetch(
@@ -275,6 +333,10 @@ async fn main() {
                 extract.as_deref(),
                 all,
                 headers,
+                har.as_deref(),
+                har_raw,
+                allow_private_ips,
+                telemetry,
                 timeout,
             )
             .await
@@ -310,7 +372,7 @@ async fn main() {
         Commands::Run {
             script, timeout, ..
         } => run_script(&script, timeout).await,
-        Commands::Session => session::run_session().await,
+        Commands::Session { allow_private_ips } => session::run_session(allow_private_ips).await,
         Commands::Serve {
             host,
             port,
@@ -318,16 +380,21 @@ async fn main() {
             allow_private_ips,
             proxy,
             auth_token,
+            mcp,
         } => {
-            run_serve(
-                &host,
-                port,
-                cookie_file.as_deref(),
-                allow_private_ips,
-                proxy,
-                auth_token,
-            )
-            .await
+            if mcp {
+                mcp::run_mcp_stdio(cookie_file.as_deref(), allow_private_ips, proxy).await
+            } else {
+                run_serve(
+                    &host,
+                    port,
+                    cookie_file.as_deref(),
+                    allow_private_ips,
+                    proxy,
+                    auth_token,
+                )
+                .await
+            }
         }
         Commands::Search {
             query,
@@ -435,10 +502,19 @@ async fn run_fetch(
     extract_sel: Option<&str>,
     all: bool,
     headers: bool,
+    har: Option<&Path>,
+    har_raw: bool,
+    allow_private_ips: bool,
+    telemetry: bool,
     timeout: u64,
 ) -> i32 {
     let start = Instant::now();
     let json = use_json(json);
+
+    if let (true, Some(path)) = (har_raw, har) {
+        eprintln!("⚠ --har-raw: HAR will contain UNREDACTED cookies, tokens, and POST bodies.");
+        audit_sensitive_action("har_raw_export", &format!("path={}", path.display()));
+    }
 
     // Validate
     if let Some(e) = validate_fetch_inputs(url, click, fill, wait, extract_sel, eval) {
@@ -452,7 +528,13 @@ async fn run_fetch(
     let needs_tab =
         click.is_some() || fill.is_some() || press.is_some() || wait.is_some() || eval.is_some();
 
-    let config = oxibrowser_core::BrowserConfig::headless();
+    let mut config = oxibrowser_core::BrowserConfig::headless();
+    if allow_private_ips {
+        config.enable_ssrf_filter = false;
+        eprintln!("⚠ SSRF filter disabled: private/internal IP ranges accessible.");
+    }
+    config.telemetry = telemetry;
+    FETCH_TELEMETRY.store(telemetry, std::sync::atomic::Ordering::Relaxed);
     let browser = match oxibrowser_core::Browser::new(config).await {
         Ok(b) => b,
         Err(e) => return print_error(&format!("browser init failed: {e}"), "RUNTIME_ERROR", json),
@@ -477,6 +559,8 @@ async fn run_fetch(
             extract_sel,
             all,
             headers,
+            har,
+            har_raw,
             timeout,
         )
         .await
@@ -493,11 +577,24 @@ async fn run_fetch(
             extract_sel,
             all,
             headers,
+            har,
+            har_raw,
         )
         .await
     };
 
     browser.close().await.ok();
+
+    // Telemetry (#15): report the recorded API gaps on exit. Note the
+    // default log filter is `warn` — set RUST_LOG=info (or more specific)
+    // to see this on stderr.
+    if telemetry {
+        let gaps = oxibrowser_core::js::runtime::telemetry_snapshot()
+            .into_iter()
+            .take(20)
+            .collect::<Vec<_>>();
+        info!(gaps = ?gaps, "web api gaps (top 20 by access count)");
+    }
 
     match result {
         Ok(()) => 0,
@@ -508,6 +605,82 @@ async fn run_fetch(
 struct FetchError {
     msg: String,
     code: String,
+}
+
+/// Record a CLI-sensitive action on the audit log. No-op when audit is
+/// disabled/uninitialized.
+fn audit_sensitive_action(action: &str, reason: &str) {
+    use oxibrowser_core::security::audit::{self, AuditDecision, AuditEvent, AuditEventKind};
+    audit::record(AuditEvent {
+        action: Some(action.to_string()),
+        ..audit::event(
+            AuditEventKind::SensitiveAction,
+            AuditDecision::Allow,
+            reason,
+        )
+    });
+}
+
+/// Write the network log as pretty HAR JSON to the `--har` path.
+///
+/// Returns `(path, entries)` for output metadata, or `None` when `--har` was
+/// not given.
+fn write_har(path: Option<&Path>, har: Value) -> Result<Option<(String, usize)>, FetchError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let entries = har["log"]["entries"].as_array().map_or(0, |a| a.len());
+    let body = serde_json::to_string_pretty(&har).map_err(|e| FetchError {
+        msg: format!("HAR serialization failed: {e}"),
+        code: "RUNTIME_ERROR".into(),
+    })?;
+    std::fs::write(path, body).map_err(|e| FetchError {
+        msg: format!("failed to write HAR file {}: {e}", path.display()),
+        code: "RUNTIME_ERROR".into(),
+    })?;
+    Ok(Some((path.display().to_string(), entries)))
+}
+
+/// Whether the current fetch run enabled Web API gap telemetry
+/// (`fetch --telemetry`). Read by `print_json_with_har` to inject the
+/// gap snapshot into `meta.api_gaps` for `--json` output.
+static FETCH_TELEMETRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print a success response, injecting `har_path`/`entries` into `meta` when
+/// `--har` was given.
+fn print_json_with_har(resp: output::CliResponse, har_meta: Option<&(String, usize)>) {
+    let mut value = serde_json::to_value(&resp).unwrap_or_else(|e| {
+        serde_json::json!({"ok": false, "error": format!("serialization: {e}"), "error_code": "INTERNAL"})
+    });
+    if let (Some(meta), Some((path, entries))) = (value.get_mut("meta"), har_meta) {
+        meta["har_path"] = Value::String(path.clone());
+        meta["entries"] = serde_json::json!(entries);
+    }
+    // Telemetry (#15): with `--telemetry`, add the recorded API-gap snapshot
+    // (count-descending) to `meta`. Read-only — counters are not reset.
+    if FETCH_TELEMETRY.load(std::sync::atomic::Ordering::Relaxed) {
+        let gaps: Vec<Value> = oxibrowser_core::js::runtime::telemetry_snapshot()
+            .into_iter()
+            .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
+            .collect();
+        if !gaps.is_empty() {
+            let meta = match value.get_mut("meta").and_then(|m| m.as_object_mut()) {
+                Some(meta) => meta,
+                None => {
+                    // CliResponse serializes `meta` only when present.
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("meta".to_string(), serde_json::json!({}));
+                    }
+                    value
+                        .get_mut("meta")
+                        .and_then(|m| m.as_object_mut())
+                        .expect("meta just inserted")
+                }
+            };
+            meta.insert("api_gaps".to_string(), Value::Array(gaps));
+        }
+    }
+    println!("{}", serde_json::to_string(&value).unwrap_or_default());
 }
 
 impl From<oxibrowser_core::error::CoreError> for FetchError {
@@ -533,6 +706,8 @@ async fn fetch_direct(
     extract_sel: Option<&str>,
     all: bool,
     headers: bool,
+    har: Option<&Path>,
+    har_raw: bool,
 ) -> Result<(), FetchError> {
     let session = browser.new_page(url).await.map_err(FetchError::from)?;
     let guard = session.read().await;
@@ -540,6 +715,15 @@ async fn fetch_direct(
         msg: "no page loaded".into(),
         code: "PAGE_NOT_LOADED".into(),
     })?;
+
+    let har_meta = if har_raw {
+        write_har(har, guard.network_log_har_raw())?
+    } else {
+        write_har(har, guard.network_log_har())?
+    };
+    if let Some((path, entries)) = &har_meta {
+        info!("HAR written to {path} ({entries} entries)");
+    }
 
     if headers {
         eprintln!("HTTP {}", page.status());
@@ -555,7 +739,7 @@ async fn fetch_direct(
                 None,
                 start.elapsed().as_millis() as u64,
             );
-            resp.print_json();
+            print_json_with_har(resp, har_meta.as_ref());
         } else {
             // Human: print summary as key-value
             let obj = data.as_object().unwrap();
@@ -597,7 +781,7 @@ async fn fetch_direct(
                 let resp = output::CliResponse::success(serde_json::json!({
                     "selector": sel, "count": texts.len(), "items": texts
                 }));
-                resp.print_json();
+                print_json_with_har(resp, har_meta.as_ref());
             } else {
                 for t in &texts {
                     println!("{t}");
@@ -613,7 +797,7 @@ async fn fetch_direct(
                 let resp = output::CliResponse::success(serde_json::json!({
                     "selector": sel, "match": text
                 }));
-                resp.print_json();
+                print_json_with_har(resp, har_meta.as_ref());
             } else {
                 println!("{text}");
             }
@@ -669,8 +853,9 @@ async fn fetch_direct(
         if let Some(f) = fields {
             output::filter_fields(&mut data, &output::parse_fields(f));
         }
-        output::CliResponse::success_with_meta(data, None, start.elapsed().as_millis() as u64)
-            .print_json();
+        let resp =
+            output::CliResponse::success_with_meta(data, None, start.elapsed().as_millis() as u64);
+        print_json_with_har(resp, har_meta.as_ref());
     } else {
         print!("{body}");
     }
@@ -697,6 +882,8 @@ async fn fetch_with_tab(
     extract_sel: Option<&str>,
     all: bool,
     headers: bool,
+    har: Option<&Path>,
+    har_raw: bool,
     timeout: u64,
 ) -> Result<(), FetchError> {
     let tab = browser.new_tab().await.map_err(FetchError::from)?;
@@ -739,11 +926,31 @@ async fn fetch_with_tab(
         tab.press(keys).await.map_err(FetchError::from)?;
     }
 
+    let har_meta = if har_raw {
+        write_har(
+            har,
+            tab.network_log_har_raw_json()
+                .await
+                .map_err(FetchError::from)?,
+        )?
+    } else {
+        write_har(
+            har,
+            tab.network_log_har_json().await.map_err(FetchError::from)?,
+        )?
+    };
+    if let Some((path, entries)) = &har_meta {
+        info!("HAR written to {path} ({entries} entries)");
+    }
+
     // Eval
     if let Some(expr) = eval {
         let value = tab.evaluate(expr).await.map_err(FetchError::from)?;
         if json {
-            output::CliResponse::success(serde_json::json!({"value": value})).print_json();
+            print_json_with_har(
+                output::CliResponse::success(serde_json::json!({"value": value})),
+                har_meta.as_ref(),
+            );
         } else {
             match value {
                 Value::String(s) => println!("{s}"),
@@ -762,8 +969,14 @@ async fn fetch_with_tab(
             "status": content.status, "text_length": content.markdown.len(),
         });
         if json {
-            output::CliResponse::success_with_meta(data, None, start.elapsed().as_millis() as u64)
-                .print_json();
+            print_json_with_har(
+                output::CliResponse::success_with_meta(
+                    data,
+                    None,
+                    start.elapsed().as_millis() as u64,
+                ),
+                har_meta.as_ref(),
+            );
         } else {
             eprintln!("URL: {}", content.url);
             eprintln!("Title: {}", content.title);
@@ -783,10 +996,12 @@ async fn fetch_with_tab(
                 .filter(|t| !t.is_empty())
                 .collect();
             if json {
-                output::CliResponse::success(serde_json::json!({
-                    "selector": sel, "count": items.len(), "items": items
-                }))
-                .print_json();
+                print_json_with_har(
+                    output::CliResponse::success(serde_json::json!({
+                        "selector": sel, "count": items.len(), "items": items
+                    })),
+                    har_meta.as_ref(),
+                );
             } else {
                 for t in &items {
                     println!("{t}");
@@ -839,8 +1054,10 @@ async fn fetch_with_tab(
         if let Some(f) = fields {
             output::filter_fields(&mut data, &output::parse_fields(f));
         }
-        output::CliResponse::success_with_meta(data, None, start.elapsed().as_millis() as u64)
-            .print_json();
+        print_json_with_har(
+            output::CliResponse::success_with_meta(data, None, start.elapsed().as_millis() as u64),
+            har_meta.as_ref(),
+        );
     } else {
         match format {
             "html" => print!("{}", content.html),

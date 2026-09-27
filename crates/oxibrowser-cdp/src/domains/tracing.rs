@@ -111,9 +111,8 @@ mod tests {
     use oxibrowser_core::network::intercept::shared_registry;
     use oxibrowser_core::{Browser, BrowserConfig};
     use serde_json::json;
-    use std::collections::HashMap;
+
     use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     async fn make_ctx() -> (DispatchContext, crate::event::EventReceiver) {
         let mut config = BrowserConfig::headless();
@@ -127,7 +126,7 @@ mod tests {
             fetch_registry: shared_registry(),
             dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
             browser,
-            child_targets: Arc::new(RwLock::new(HashMap::new())),
+            child_targets: Arc::new(crate::domains::TargetRegistry::new()),
         };
         (ctx, rx)
     }

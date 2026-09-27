@@ -3,7 +3,7 @@
 > Living roadmap. Historical milestone plans (v0.5 era) live in git history;
 > dated design docs live in `designs/`.
 
-## Current state (v0.22)
+## Current state (v0.23)
 
 | | |
 |---|---|
@@ -14,21 +14,21 @@
 | JS | boa_engine 0.20 (ES2024+), wasmi WASM bridge, dedicated JS thread |
 | Protocols | CDP (WebSocket), Puppeteer/Playwright compatible |
 | Anti-bot | wreq TLS fingerprint impersonation, stealth navigator surface, challenge handling |
+| Security | HAR/CDP-event redaction by default, password masking + capture guard, JSONL audit log, origin-policy primitives |
 
-Recently shipped (v0.22.0):
+Recently shipped (v0.23.0):
 
-- `Page.startScreencast`/`stopScreencast`/`screencastFrameAck` — generation-token
-  frame suppression; DOM-mutation bindings journal before applying, so only real
-  document changes emit frames.
-- `OXI.getInteractiveElements` — document-order interactive elements with
-  computed roles and unique CSS selector paths (browser-use workflows).
-- `matchMedia`, `DOMParser`, `structuredClone`, `requestIdleCallback` in the JS
-  runtime.
-- `Page.printToPDF` — real multi-page pagination (A4/Letter, orientation,
-  margins) via `oxibrowser_render::png_to_pdf_paged`.
-- JS-thread hardening — live element objects serialize safely as eval results
-  (tree accessors and `children`/`parentNode` are non-enumerable; no more
-  `JSON.stringify` stack overflow).
+- Secret redaction on by default — `--har` and CDP network event URLs scrub
+  auth headers and sensitive query/body values; `--har-raw` is an audited
+  opt-out, `--redact-header` extends the list. See
+  `designs/2026-09-27-agent-auth-implementation.md` (P0/M0.1–M0.4 + M1).
+- Password masking in DOM observations and a screenshot/PDF capture guard
+  while a password field has focus.
+- JSONL audit log (`--audit`/`--no-audit`) with handle+fingerprint credential
+  references — no secret values in logs.
+- `network::origin_policy` — exact-origin matching, DNS label-boundary
+  checks, fail-closed frame-origin evaluation (foundation for the credential
+  broker, P1).
 
 ## Next
 

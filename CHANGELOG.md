@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-27
+
+Agent unattended-auth security hardening (P0 of
+[docs/research/00-SYNTHESIS.md](docs/research/00-SYNTHESIS.md) →
+[designs/2026-09-27-agent-auth-implementation.md](docs/designs/2026-09-27-agent-auth-implementation.md)).
+
+### Added
+- **stdio MCP server** — `oxibrowser serve --mcp` speaks newline-delimited
+  JSON-RPC 2.0 over stdin/stdout (`initialize`, `tools/list`, `tools/call`)
+  with nine browser tools against a lazily-created, reused `Tab`; all logging
+  goes to stderr.
+- **OXI stable element refs** — `getInteractiveElements`/`ariaSnapshot` hand
+  out `e{N}` refs backed by a per-session registry (node id, document
+  generation, content fingerprint, CSS selector); `clickRef`/`fillRef`/
+  `waitRef` answer "stale ref — re-observe" when the page drifted.
+- **`save-state` / `load-state` session REPL commands** — Playwright
+  `storageState` JSON round-trip for the active tab (`SaveState`/`LoadState`).
+- **wreq Chrome-149 transport emulation** — `HttpClient` moves to `wreq`
+  (`Emulation::Chrome149`: TLS fingerprint, HTTP/2 settings, header order)
+  so the wire fingerprint matches the JS `navigator` surface; stealth docs
+  updated to the two-layer coherence model.
+- **HAR/network-log redaction on by default** — `--har` output now replaces
+  `Authorization`/`Cookie`/`Set-Cookie`/`x-api-key`-family headers, sensitive
+  URL query values (`token`, `access_token`, `code`, …), and non-form POST
+  bodies with a fixed `__REDACTED__` marker; form bodies are field-redacted.
+  `--har-raw` opts out explicitly with a stderr warning and an audit event.
+  `--redact-header NAME` (repeatable, global) extends the list with
+  organization-specific auth headers; it also applies to CDP network event
+  URLs (`requestWillBeSent`/`responseReceived`/`documentURL`).
+- **Password masking in DOM observations** — `input[type=password]` values are
+  masked in every `DomSnapshot`-backed read (`OXI.getInteractiveElements`,
+  HTML serialization, extract), and the accessible-name `value` fallback
+  skips password inputs. Fill paths are unaffected (selectors + explicit
+  values never read the snapshot).
+- **Screenshot capture guard** — `Page.captureScreenshot`, `Page.printToPDF`,
+  and screencast refuse to capture while a password input has focus; CDP
+  clients receive the error instead of a blank PNG/PDF page. Audited as
+  `capture_blocked_password_focus`.
+- **JSONL audit log** — append-only `~/.oxibrowser/audit.jsonl` (global
+  `--audit <PATH>` / `--no-audit`) recording `sensitive_action`
+  (`har_raw_export`, `cookie_file_save`), `session_teardown` (cookie disposal
+  counts), and `policy_violation` events. Credentials are referenced by
+  handle + SHA-256 fingerprint (first 8 hex), never by value.
+- **`network::origin_policy`** — exact-origin policy primitives for upcoming
+  credential use: normalized origins (punycode/default-port), DNS
+  label-boundary host matching (`notexample.com` cannot match
+  `example.com`), fail-closed frame-origin checks, deny-first rule
+  evaluation, and redirect-escape verdicts.
+
+### Changed
+- **Cookie jar disposed on close** — `Browser::close` clears the in-memory
+  jar by default (`BrowserConfig::clear_cookies_on_close`, builder
+  `cookies_on_close`). `--cookie-file` persistence still happens first.
+- **`/json/version` and `Browser.getVersion` report the real product
+  version** (`OxiBrowser/<crate version>`) instead of a hardcoded
+  `OxiBrowser/0.1.0`; the JS-runtime default UA follows the crate version.
+
 ## [0.22.0] - 2026-09-26
 
 ### Added

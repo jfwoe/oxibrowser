@@ -9,7 +9,15 @@
 use crate::domains::{DispatchContext, DomainResult};
 use crate::event::EventSender;
 use crate::protocol::CdpError;
+use oxibrowser_core::security::redact::{RedactionProfile, redact_url_query};
 use serde_json::{Value, json};
+
+/// Redaction profile for CDP network event URLs. Event headers are currently
+/// emitted as empty objects — if request headers are ever added to these
+/// events they MUST pass through `redact::redact_headers` (design §7 P0-1).
+fn event_url_redaction() -> RedactionProfile {
+    oxibrowser_core::security::redact::active_profile()
+}
 
 /// Dispatch Network domain methods.
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
@@ -17,9 +25,11 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         // --- State ---
         "enable" => enable(ctx),
         "disable" => disable(ctx),
+        // No HTTP cache layer exists (responses are always fetched fresh), so
+        // enabling cache-disabling is a no-op over an empty set.
         "setCacheDisabled" => Ok(Some(json!({}))),
-        "setExtraHTTPHeaders" => Ok(Some(json!({}))),
-        "emulateNetworkConditions" => Ok(Some(json!({}))),
+        "setExtraHTTPHeaders" => set_extra_http_headers(params, ctx).await,
+        "emulateNetworkConditions" => emulate_network_conditions(params, ctx).await,
 
         // --- Cookies ---
         "getAllCookies" => get_all_cookies(ctx).await,
@@ -29,6 +39,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
 
         // --- Response body ---
         "getResponseBody" => get_response_body(params, ctx).await,
+        "getRequestPostData" => get_request_post_data(params, ctx).await,
 
         // --- Extra ---
         "setRequestInterception" => Ok(Some(json!({}))),
@@ -54,6 +65,53 @@ fn enable(ctx: &DispatchContext) -> DomainResult {
 /// Network.disable — disables network tracking.
 fn disable(ctx: &DispatchContext) -> DomainResult {
     ctx.events.set_network_enabled(false);
+    Ok(Some(json!({})))
+}
+
+/// `Network.setExtraHTTPHeaders` — replace the session's extra header set.
+///
+/// `params.headers` is a header object (`name → string value`); `null` or a
+/// missing param clears the extra headers. The `user_agent` override set via
+/// `Emulation.setUserAgentOverride` is preserved (Chrome keeps the two
+/// independent). Transport-managed header names (`Cookie`, `Host`,
+/// `Content-Length` — case-insensitive) are accepted here but skipped by the
+/// HTTP client at request time, since the cookie jar / connection own them.
+async fn set_extra_http_headers(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let headers_val = params
+        .and_then(|p| p.get("headers").cloned())
+        .unwrap_or(Value::Null);
+
+    let mut session = ctx.session.write().await;
+    let mut overrides = session.overrides().clone();
+    overrides.extra_headers = match headers_val {
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(name, value)| value.as_str().map(|v| (name, v.to_string())))
+            .collect(),
+        // null / missing / non-object → clear.
+        _ => Vec::new(),
+    };
+    session.set_overrides(overrides);
+    drop(session);
+
+    tracing::debug!("Network.setExtraHTTPHeaders");
+    Ok(Some(json!({})))
+}
+
+/// `Network.emulateNetworkConditions` — only the `offline` flag is honored;
+/// it gates every Session-issued fetch (documents, sub-resources, POSTs) and
+/// JS-issued fetches at the bridge. `latency` (ms) and
+/// `downloadThroughput`/`uploadThroughput` (bytes/s) are accepted for
+/// protocol compatibility but not applied — there is no throttling layer.
+async fn emulate_network_conditions(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let offline = params
+        .get("offline")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    ctx.session.read().await.set_offline(offline);
+    tracing::debug!(offline, "Network.emulateNetworkConditions");
     Ok(Some(json!({})))
 }
 
@@ -239,6 +297,52 @@ async fn get_response_body(params: Option<Value>, ctx: &DispatchContext) -> Doma
     }
 }
 
+/// `Network.getRequestPostData` — return the recorded POST body of a request.
+///
+/// Looks `params.requestId` up in the session's rolling network log. When the
+/// body was truncated at the log cap (`post_body_truncated`), the stored
+/// prefix is decoded and returned as-is: the remainder was never captured,
+/// so a truncated prefix beats failing the call (documented deviation from
+/// Chrome, which returns the full body).
+async fn get_request_post_data(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.ok_or_else(|| CdpError {
+        code: -32602,
+        message: "getRequestPostData requires parameters".to_string(),
+    })?;
+    let request_id = params
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "requestId required".to_string(),
+        })?;
+
+    let records = ctx.session.read().await.network_log_snapshot();
+    let post_data = request_post_data(&records, request_id)?;
+    Ok(Some(json!({ "postData": post_data })))
+}
+
+/// Resolve `Network.getRequestPostData` against a network-log snapshot.
+///
+/// Pure helper: `Ok(body)` when the request carries a POST body (decoded
+/// UTF-8, lossy for invalid sequences); the `-32000`
+/// "No resource with given identifier found" error when the id is unknown or
+/// the request recorded no body.
+fn request_post_data(
+    records: &[oxibrowser_core::session::RequestRecord],
+    request_id: &str,
+) -> Result<String, CdpError> {
+    records
+        .iter()
+        .find(|r| r.request_id == request_id)
+        .and_then(|r| r.post_body.as_deref())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .ok_or(CdpError {
+            code: -32000,
+            message: "No resource with given identifier found".to_string(),
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Event emission (called from Page domain during navigation)
 // ---------------------------------------------------------------------------
@@ -256,6 +360,7 @@ pub fn emit_navigation_events(
     content_type: &str,
 ) {
     let timestamp = EventSender::timestamp_ms();
+    let url = redact_url_query(url, &event_url_redaction());
 
     events.send_network_event(
         "Network.requestWillBeSent",
@@ -279,7 +384,7 @@ pub fn emit_navigation_events(
         }),
     );
 
-    emit_response_events(events, request_id, url, loader_id, status, content_type);
+    emit_response_events(events, request_id, &url, loader_id, status, content_type);
 }
 
 /// Emit only the response lifecycle events (responseReceived + loadingFinished).
@@ -295,6 +400,7 @@ pub fn emit_response_events(
     content_type: &str,
 ) {
     let timestamp = EventSender::timestamp_ms();
+    let url = redact_url_query(url, &event_url_redaction());
 
     events.send_network_event(
         "Network.responseReceived",
@@ -326,4 +432,167 @@ pub fn emit_response_events(
             "encodedDataLength": 0.0,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::event_channel;
+    use oxibrowser_core::network::intercept::shared_registry;
+    use oxibrowser_core::session::RequestOverrides;
+    use oxibrowser_core::{Browser, BrowserConfig};
+    use std::sync::Arc;
+
+    /// Build a DispatchContext backed by a real Browser session.
+    async fn make_ctx() -> DispatchContext {
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        let browser = Arc::new(Browser::new(config).await.unwrap());
+        let session = browser.new_session().await.unwrap();
+        let (events, _rx) = event_channel();
+        DispatchContext {
+            session,
+            events,
+            fetch_registry: shared_registry(),
+            dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
+            browser,
+            child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_extra_http_headers_replaces_and_clears() {
+        let ctx = make_ctx().await;
+
+        // Seed a UA override that must survive header updates.
+        ctx.session.write().await.set_overrides(RequestOverrides {
+            user_agent: Some("OverrideUA/1.0".to_string()),
+            extra_headers: Vec::new(),
+        });
+
+        let params = json!({
+            "headers": { "X-Test": "1", "Accept-Language": "ko-KR" },
+        });
+        handle("setExtraHTTPHeaders", Some(params), &ctx)
+            .await
+            .unwrap();
+        {
+            let session = ctx.session.read().await;
+            // JSON objects are unordered — compare as sets.
+            let mut got = session.overrides().extra_headers.clone();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    ("Accept-Language".to_string(), "ko-KR".to_string()),
+                    ("X-Test".to_string(), "1".to_string()),
+                ]
+            );
+            // user_agent preserved.
+            assert_eq!(
+                session.overrides().user_agent.as_deref(),
+                Some("OverrideUA/1.0")
+            );
+        }
+
+        // Explicit null clears extra headers, still preserving the UA.
+        handle(
+            "setExtraHTTPHeaders",
+            Some(json!({ "headers": null })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        {
+            let session = ctx.session.read().await;
+            assert!(session.overrides().extra_headers.is_empty());
+            assert_eq!(
+                session.overrides().user_agent.as_deref(),
+                Some("OverrideUA/1.0")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn emulate_network_conditions_toggles_offline() {
+        let ctx = make_ctx().await;
+        assert!(!ctx.session.read().await.is_offline());
+
+        handle(
+            "emulateNetworkConditions",
+            Some(json!({ "offline": true, "latency": 100, "downloadThroughput": -1.0, "uploadThroughput": -1.0 })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(ctx.session.read().await.is_offline());
+
+        handle(
+            "emulateNetworkConditions",
+            Some(json!({ "offline": false })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.session.read().await.is_offline());
+    }
+
+    #[tokio::test]
+    async fn set_cache_disabled_acknowledges() {
+        let ctx = make_ctx().await;
+        let r = handle(
+            "setCacheDisabled",
+            Some(json!({ "cacheDisabled": true })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Some(json!({})));
+    }
+
+    // -- Network.getRequestPostData --------------------------------------
+
+    use oxibrowser_core::session::RequestRecord;
+
+    fn record_with_post_body(request_id: &str, post_body: Option<Vec<u8>>) -> RequestRecord {
+        RequestRecord {
+            request_id: request_id.to_string(),
+            url: "http://example.com/submit".to_string(),
+            method: "POST".to_string(),
+            resource_type: "Fetch".to_string(),
+            request_headers: Vec::new(),
+            post_body,
+            post_body_truncated: false,
+            status: Some(200),
+            response_headers: Vec::new(),
+            mime_type: String::new(),
+            started_at_ms: 1_000_000.0,
+            finished_at_ms: Some(1_000_042.0),
+            from_cache: false,
+            response_body_length: None,
+        }
+    }
+
+    #[test]
+    fn request_post_data_miss_is_no_such_resource_error() {
+        let records = vec![record_with_post_body("oxi-1", Some(b"payload".to_vec()))];
+        let err = request_post_data(&records, "oxi-404").expect_err("unknown id must error");
+        assert_eq!(err.code, -32000);
+        assert_eq!(err.message, "No resource with given identifier found");
+    }
+
+    #[test]
+    fn request_post_data_decodes_body_and_errors_when_body_absent() {
+        // Known id with a body → decoded (lossy UTF-8) string.
+        let records = vec![record_with_post_body(
+            "oxi-1",
+            Some("héllo=1".as_bytes().to_vec()),
+        )];
+        assert_eq!(request_post_data(&records, "oxi-1").unwrap(), "héllo=1");
+
+        // Known id without a recorded body → same -32000 as a miss.
+        let records = vec![record_with_post_body("oxi-2", None)];
+        let err = request_post_data(&records, "oxi-2").expect_err("absent body must error");
+        assert_eq!(err.code, -32000);
+    }
 }

@@ -14,7 +14,9 @@ pub mod fonts;
 pub mod frame;
 pub mod page;
 pub mod script;
+pub mod security;
 pub mod session;
+pub mod storage_state;
 pub mod tab;
 
 pub mod js;
@@ -35,4 +37,5 @@ pub use config::BrowserConfig;
 pub use config::BrowserConfigBuilder;
 pub use error::Result;
 pub use event::BrowserEvent;
+pub use storage_state::{OriginState, StorageState};
 pub use tab::Tab;

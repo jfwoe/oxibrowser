@@ -12,12 +12,14 @@
 //! Defeats naive/medium bot detection that reads `navigator.webdriver`,
 //! `navigator.plugins.length`, `window.chrome`, `navigator.permissions.query`,
 //! and `navigator.userAgentData`. It does **not** touch the TLS/HTTP-2
-//! transport fingerprint (reqwest/rustls, not Chrome's BoringSSL) nor
+//! transport fingerprint — that is `wreq`'s job (`Emulation::Chrome149`
+//! transport emulation in `network/client.rs`, not this module) — nor
 //! boa↔V8 behavioural fidelity, so **correlating** detection
 //! (Cloudflare/DataDome/CreepJS) will still flag the cross-layer mismatch.
 //! That gap is closed by the **pure-Rust cross-layer stealth design** — a
-//! `ChromeProfile` driving TLS (rustls), H2 (`h2`), and this JS surface to a
-//! mutually-consistent Chrome fingerprint — NOT by adopting real Chromium.
+//! `ChromeProfile` driving the `wreq` transport (Chrome TLS/HTTP-2
+//! emulation) and this JS surface to a mutually-consistent Chrome
+//! fingerprint — NOT by adopting real Chromium.
 //! See `docs/designs/2026-06-25-pure-rust-stealth.md`.
 //!
 //! ## Profile coherence

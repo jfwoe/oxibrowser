@@ -306,7 +306,7 @@ async fn test_http_json_version() {
     assert!(resp.status().is_success());
 
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["browser"], "OxiBrowser/0.1.0");
+    assert!(body["browser"].as_str().unwrap().starts_with("OxiBrowser/"));
     assert_eq!(body["protocolVersion"], "1.3");
     assert!(body["webSocketDebuggerUrl"].is_string());
 

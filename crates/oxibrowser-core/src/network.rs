@@ -4,8 +4,10 @@ pub mod auth;
 pub mod client;
 pub mod cookie;
 pub mod cors;
+pub mod har;
 pub mod intercept;
 pub mod ip_filter;
+pub mod origin_policy;
 pub mod resource;
 pub mod robots;
 pub mod ws;
@@ -17,6 +19,7 @@ pub use intercept::{
     SharedRegistry,
 };
 pub use ip_filter::IpFilter;
+pub use origin_policy::{Origin, OriginError, OriginMatch, OriginPolicy, OriginRule};
 pub use robots::RobotStore;
 
 // Re-export wreq Response for use in HttpClient::fetch return type

@@ -9,11 +9,10 @@
 |------|---------|------:|
 | `./` | **Top-level architecture, design rationale, quickstart, roadmap.** | 7 |
 | `design/` | Focused design notes for in-flight subsystems (observability, search-as-library). | 2 |
-| `designs/` | Dated design documents per planning cycle (v0.3 → v0.6, plus topic designs). | 13 |
-| `archive/` | Superseded versions, scoped topic designs, and transient agent reports. | 13 |
+| `designs/` | Dated design documents per planning cycle (v0.3 → v0.6, plus topic designs). | 14 |
+| `research/` | Dated multi-agent research reports (sources cited, roadmap inputs). | 7 |
 
-Total active docs (root + `design/` + `designs/`): **22** `.md` files.
-Archived (out of root, kept for history): 9 in `archive/`, 4 in `archive/transient/`.
+Total active docs (root + `design/` + `designs/` + `research/`): **30** `.md` files.
 
 ## Top-level docs (root)
 
@@ -47,6 +46,22 @@ Archived (out of root, kept for history): 9 in `archive/`, 4 in `archive/transie
 | `merge-guide.md` | Merge / contribution walkthrough |
 | `session-a-web-platform.md` | Session A working notes — web platform side |
 | `session-b-cdp-perf.md` | Session B working notes — CDP perf side |
+| `2026-09-27-agent-auth-implementation.md` | Agent unattended auth — implementation design (from `research/` 2026-09-27) |
+
+
+## `research/` — dated research reports (2026-09-27: agent unattended authentication)
+
+Six parallel sub-agent investigations + synthesis, sourced from official docs. Roadmap input for
+credential/session/auth capabilities. Concretized into `designs/2026-09-27-agent-auth-implementation.md`
+(same date) — implementation design with code re-verification and drift notes.
+
+- `00-SYNTHESIS.md` — Master synthesis: 4-layer strategy (API-first → session persistence → credential broker → human escalation), gap analysis vs current code, P0/P1/P2 roadmap.
+- `01-keychain.md` — macOS keychain model (TN3137): ACL/partition-ID, Rust paths (`keyring`), broker comparison, JSON record format with `otpauth://`.
+- `02-session-persistence.md` — storageState/profile reuse, cookie partitioning (CHIPS), Cloudflare bot-detection constraints, encrypted session-store design.
+- `03-api-first-matrix.md` — Unattended-path matrix: Cloudflare tunnel 100% API, Tailscale autoApprovers, Apple iCloud sign-out structurally impossible.
+- `04-2fa-passkeys.md` — WebAuthn virtual authenticator (CDP), TOTP pipeline, iCloud passkey limits, human-escalation state machine, step-up policy.
+- `05-landscape.md` — How Operator/computer-use/browser-use/Steel/Browserbase/Stagehand/Skyvern handle auth; Top-5 patterns to copy.
+- `06-safety-design.md` — Threat model, consent records (credential × origin × action), exact-origin matching, HAR redaction, confirmation protocol, 8 concrete integration points.
 
 ## `archive/` — superseded designs and transient reports
 

@@ -13,6 +13,7 @@ use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
 use oxibrowser_core::js::{
     js_dispatch_drag_event, js_dispatch_key_event, js_dispatch_mouse_event, js_insert_text,
+    js_scroll,
 };
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,8 +26,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "dispatchDragEvent" => dispatch_drag_event(params, ctx).await,
         "insertText" => insert_text(params, ctx).await,
         "imeSetComposition" => ime_set_composition(params, ctx).await,
-        "synthesizePinchGesture" => Ok(Some(json!({}))),
-        "synthesizeScrollGesture" => Ok(Some(json!({}))),
+        "synthesizeScrollGesture" => synthesize_scroll_gesture(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
             message: format!("Input.{} not implemented", method),
@@ -217,6 +217,35 @@ async fn dispatch_drag_event(params: Option<Value>, ctx: &DispatchContext) -> Do
     tracing::debug!(event_type, x, y, "Input.dispatchDragEvent");
 
     let js = js_dispatch_drag_event(x, y, event_type);
+    let mut session_guard = ctx.session.write().await;
+    let _result = session_guard.evaluate_js(&js).await;
+
+    Ok(Some(json!({})))
+}
+
+/// Input.synthesizeScrollGesture — scroll the page by the gesture delta.
+///
+/// `xDelta`/`yDelta` (falling back to the spec's `xDistance`/`yDistance`)
+/// are applied as an instant scroll-by via `js::mouse::js_scroll`. Positive
+/// deltas scroll right/down, matching `scrollLeft`/`scrollTop` semantics.
+/// `gestureType`, `x`/`y` and the speed/repeat parameters are accepted but
+/// ignored — no timed pointer sequence is synthesized.
+async fn synthesize_scroll_gesture(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let p = params.unwrap_or_default();
+    let dx = p
+        .get("xDelta")
+        .or_else(|| p.get("xDistance"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let dy = p
+        .get("yDelta")
+        .or_else(|| p.get("yDistance"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    tracing::debug!(dx, dy, "Input.synthesizeScrollGesture");
+
+    let js = js_scroll(dx, dy);
     let mut session_guard = ctx.session.write().await;
     let _result = session_guard.evaluate_js(&js).await;
 

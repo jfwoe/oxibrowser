@@ -46,7 +46,7 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
             post_data,
             timestamp,
         } => emit_request_will_be_sent(
-            events, request_id, url, method, headers, post_data, timestamp, session,
+            events, request_id, url, method, headers, post_data, "XHR", timestamp, session,
         ),
         CoreEvent::FetchResponse {
             request_id,
@@ -55,8 +55,85 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
             mime_type,
             timestamp,
         } => emit_response_received(
-            events, request_id, url, status, mime_type, timestamp, session,
+            events, request_id, url, status, mime_type, "XHR", timestamp, session,
         ),
+        CoreEvent::SubresourceFetchRequest {
+            request_id,
+            url,
+            method,
+            resource_type,
+            timestamp,
+        } => emit_request_will_be_sent(
+            events,
+            request_id,
+            url,
+            method,
+            Vec::new(),
+            None,
+            &resource_type,
+            timestamp,
+            session,
+        ),
+        CoreEvent::SubresourceFetchResponse {
+            request_id,
+            url,
+            status,
+            mime_type,
+            length,
+            timestamp,
+        } => {
+            emit_response_received(
+                events,
+                request_id.clone(),
+                url.clone(),
+                status,
+                mime_type,
+                // The paired requestWillBeSent already carried the resource
+                // type; response type mirrors it via the same event id.
+                "Other",
+                timestamp,
+                session,
+            );
+            send_net(
+                events,
+                session,
+                "Network.loadingFinished",
+                json!({
+                    "requestId": request_id,
+                    "timestamp": timestamp / 1000.0,
+                    "encodedDataLength": length as f64,
+                }),
+            );
+        }
+        CoreEvent::SubresourceFetchFailed {
+            request_id,
+            url,
+            error_text,
+            timestamp,
+        } => {
+            emit_request_will_be_sent(
+                events,
+                request_id.clone(),
+                url,
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                "Other",
+                timestamp,
+                session,
+            );
+            send_net(
+                events,
+                session,
+                "Network.loadingFailed",
+                json!({
+                    "requestId": request_id,
+                    "timestamp": timestamp / 1000.0,
+                    "errorText": error_text,
+                    "canceled": false,
+                }),
+            );
+        }
         CoreEvent::FetchLoadingFinished {
             request_id,
             timestamp,
@@ -143,6 +220,60 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
                     "receivedBytes": total_bytes,
                     "state": "completed",
                     "filePath": save_path,
+                }),
+            );
+            // Browser.* twins with identical payloads. Sent ungated via
+            // `send_browser_event` (no Browser.enable flag exists); always on
+            // the root session — downloads from child (attached) targets are
+            // not sessionId-stamped (known limitation, see send_browser_event).
+            events.send_browser_event(
+                "Browser.downloadWillBegin",
+                json!({
+                    "frameId": "",
+                    "guid": guid,
+                    "url": url,
+                    "suggestedFilename": filename,
+                }),
+            );
+            events.send_browser_event(
+                "Browser.downloadProgress",
+                json!({
+                    "guid": guid,
+                    "totalBytes": total_bytes,
+                    "receivedBytes": total_bytes,
+                    "state": "completed",
+                    "filePath": save_path,
+                }),
+            );
+        }
+        CoreEvent::DownloadFailed {
+            guid,
+            url: _,
+            error: _,
+        } => {
+            // Playwright/Puppeteer watch for `state != "inprogress"`; "failed"
+            // with no filePath signals the save itself failed.
+            send_page(
+                events,
+                session,
+                "Page.downloadProgress",
+                json!({
+                    "guid": guid,
+                    "totalBytes": 0,
+                    "receivedBytes": 0,
+                    "state": "failed",
+                    "filePath": "",
+                }),
+            );
+            // Browser.* twin, same payload, ungated (see Download arm).
+            events.send_browser_event(
+                "Browser.downloadProgress",
+                json!({
+                    "guid": guid,
+                    "totalBytes": 0,
+                    "receivedBytes": 0,
+                    "state": "failed",
+                    "filePath": "",
                 }),
             );
         }
@@ -324,6 +455,7 @@ fn emit_request_will_be_sent(
     method: String,
     headers: Vec<(String, String)>,
     post_data: Option<Vec<u8>>,
+    resource_type: &str,
     timestamp: f64,
     session: Option<&str>,
 ) {
@@ -358,7 +490,7 @@ fn emit_request_will_be_sent(
             "timestamp": timestamp / 1000.0,
             "wallTime": timestamp / 1000.0,
             "initiator": { "type": "script" },
-            "type": "XHR",
+            "type": resource_type,
             "frameId": "main",
             "hasUserGesture": false,
         }),
@@ -372,6 +504,7 @@ fn emit_response_received(
     url: String,
     status: u16,
     mime_type: String,
+    resource_type: &str,
     timestamp: f64,
     session: Option<&str>,
 ) {
@@ -388,7 +521,7 @@ fn emit_response_received(
             "requestId": request_id,
             "loaderId": "0",
             "timestamp": timestamp / 1000.0,
-            "type": "XHR",
+            "type": resource_type,
             "response": {
                 "url": url,
                 "status": status,

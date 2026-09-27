@@ -10,7 +10,45 @@ use blitz_html::HtmlDocument;
 use blitz_traits::shell::ColorScheme;
 use blitz_traits::shell::Viewport as BlitzViewport;
 
+use std::sync::{LazyLock, RwLock};
+
 use crate::paint;
+
+/// Process-wide `prefers-color-scheme` override (`true` = dark, `false` =
+/// light, `None` = no override, i.e. Blitz's built-in `ColorScheme::Light`).
+///
+/// Set via [`set_color_scheme_override`] before constructing a
+/// [`RenderDocument`]; the value is read at construction time and baked into
+/// the document's viewport, so Stylo media queries like
+/// `@media (prefers-color-scheme: dark)` match accordingly.
+static COLOR_SCHEME_OVERRIDE: LazyLock<RwLock<Option<bool>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Override the `prefers-color-scheme` media query result for documents
+/// constructed afterwards. `Some(true)` forces dark, `Some(false)` forces
+/// light, `None` clears the override (Blitz defaults to light).
+pub fn set_color_scheme_override(dark: Option<bool>) {
+    *COLOR_SCHEME_OVERRIDE
+        .write()
+        .expect("color scheme override lock poisoned") = dark;
+}
+
+/// Current `prefers-color-scheme` override (`true` = dark, `false` = light,
+/// `None` = no override).
+pub fn color_scheme_override_dark() -> Option<bool> {
+    *COLOR_SCHEME_OVERRIDE
+        .read()
+        .expect("color scheme override lock poisoned")
+}
+
+/// Map the process-wide override to Blitz's shell `ColorScheme` for viewport
+/// assembly. `None` (no override) falls back to `Light`, matching the previous
+/// hardcoded value.
+fn effective_color_scheme() -> ColorScheme {
+    match color_scheme_override_dark() {
+        Some(true) => ColorScheme::Dark,
+        Some(false) | None => ColorScheme::Light,
+    }
+}
 
 /// Opaque handle to a node within a [`RenderDocument`]. Maps to Blitz's `usize`
 /// node id. Only valid for the [`RenderDocument`] that minted it.
@@ -98,7 +136,14 @@ impl RenderDocument {
         base_url: Option<&str>,
         viewport: Viewport,
     ) -> Result<Self, RenderError> {
-        let config = DocumentConfig::default();
+        // base_url MUST be in DocumentConfig: blitz-html resolves eager
+        // sub-resource ops (<img src>) DURING parsing, before the post-parse
+        // `set_base_url` runs — without this, a relative img URL panics
+        // (resolved against blitz's data: default).
+        let config = DocumentConfig {
+            base_url: base_url.map(str::to_string),
+            ..DocumentConfig::default()
+        };
         let mut doc = HtmlDocument::from_html(html, config).into_inner();
 
         if let Some(url) = base_url {
@@ -111,7 +156,7 @@ impl RenderDocument {
             viewport.width,
             viewport.height,
             viewport.scale as f32,
-            ColorScheme::Light,
+            effective_color_scheme(),
         ));
 
         // Drive Stylo restyle + Taffy relayout once so the tree is paint-ready.
@@ -133,7 +178,12 @@ impl RenderDocument {
         viewport: Viewport,
         fonts: &[Vec<u8>],
     ) -> Result<Self, RenderError> {
-        let mut config = DocumentConfig::default();
+        let mut config = DocumentConfig {
+            // See from_html: eager <img> ops resolve during parsing, so the
+            // base URL has to be present in the config, not just post-parse.
+            base_url: base_url.map(str::to_string),
+            ..DocumentConfig::default()
+        };
         if !fonts.is_empty() {
             config.font_ctx = Some(build_font_ctx(fonts));
         }
@@ -145,7 +195,7 @@ impl RenderDocument {
             viewport.width,
             viewport.height,
             viewport.scale as f32,
-            ColorScheme::Light,
+            effective_color_scheme(),
         ));
         doc.resolve(0.0);
         Ok(Self { doc, viewport })

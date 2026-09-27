@@ -7,6 +7,7 @@
 pub mod core_event;
 pub mod event;
 pub mod protocol;
+pub mod refs;
 pub mod server;
 pub mod session;
 

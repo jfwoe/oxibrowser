@@ -8,6 +8,7 @@ use crate::error::{CoreError, Result};
 use crate::event::BrowserEvent;
 use crate::network::HttpClient;
 use crate::network::cookie::CookieJar;
+use crate::security::audit;
 use crate::session::Session;
 use crate::tab::Tab;
 use parking_lot::RwLock;
@@ -229,12 +230,41 @@ impl Browser {
         }
 
         // Save cookies to disk if a cookie_file path is configured
-        if let Some(ref path) = self.config.cookie_file {
+        if let Some(path) = &self.config.cookie_file {
             let jar = self.cookie_jar.read();
-            if let Err(e) = jar.save_to_file(path) {
-                warn!(path = %path.display(), error = %e, "failed to save cookies to file");
-            } else {
-                info!(path = %path.display(), "saved cookies to file");
+            let save_result = jar.save_to_file(path);
+            drop(jar);
+            match save_result {
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to save cookies to file");
+                    audit::record(audit::event(
+                        audit::AuditEventKind::SensitiveAction,
+                        audit::AuditDecision::Deny,
+                        format!("cookie_file_save_failed path={}", path.display()),
+                    ));
+                }
+                Ok(()) => {
+                    info!(path = %path.display(), "saved cookies to file");
+                    audit::record(audit::event(
+                        audit::AuditEventKind::SensitiveAction,
+                        audit::AuditDecision::Allow,
+                        format!("cookie_file_save path={}", path.display()),
+                    ));
+                }
+            }
+        }
+
+        // Dispose of the in-memory jar so session cookies never outlive the
+        // browser (design §7 P0-3). `cookie_file` users already persisted above.
+        if self.config.clear_cookies_on_close {
+            let cleared = self.cookie_jar.write().clear_and_count();
+            if cleared > 0 {
+                audit::record(audit::event(
+                    audit::AuditEventKind::SessionTeardown,
+                    audit::AuditDecision::Allow,
+                    "browser_close",
+                ));
+                info!(cleared, "cookie jar cleared on close");
             }
         }
 
@@ -411,6 +441,37 @@ mod tests {
         // Second close should succeed without panicking
         browser.close().await.unwrap();
         assert!(!browser.is_open());
+    }
+
+    #[tokio::test]
+    async fn test_browser_close_clears_in_memory_cookie_jar() {
+        let config = BrowserConfig::headless();
+        let browser = Browser::new(config).await.unwrap();
+        {
+            let mut jar = browser.cookie_jar().write();
+            let url = url::Url::parse("https://example.com/").unwrap();
+            jar.store(&url, "sid=abc; Path=/");
+        }
+        assert!(!browser.cookie_jar().read().get_all().is_empty());
+        browser.close().await.unwrap();
+        assert!(
+            browser.cookie_jar().read().get_all().is_empty(),
+            "in-memory jar must be disposed on close"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_browser_close_keeps_jar_when_disposal_disabled() {
+        let mut config = BrowserConfig::headless();
+        config.clear_cookies_on_close = false;
+        let browser = Browser::new(config).await.unwrap();
+        {
+            let mut jar = browser.cookie_jar().write();
+            let url = url::Url::parse("https://example.com/").unwrap();
+            jar.store(&url, "sid=abc; Path=/");
+        }
+        browser.close().await.unwrap();
+        assert_eq!(browser.cookie_jar().read().get_all().len(), 1);
     }
 
     #[tokio::test]

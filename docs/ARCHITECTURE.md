@@ -6,6 +6,33 @@ OxiBrowser is a headless browser engine built in pure Rust. It follows a
 Browser → Session → Page → Frame hierarchy but is fully Rust-native with no C/C++
 dependencies.
 
+## Rendering Paths
+
+There are exactly two layout/rendering stacks; do not confuse them:
+
+1. **Live render path** (`oxibrowser-render` — the only real renderer):
+   `RenderDocument::from_html` parses HTML via Blitz (html5ever), restsyles
+   with **Stylo** (Firefox's CSS engine), lays out with **Taffy**, and
+   rasterizes via `anyrender`/`vello_cpu` with **parley** fontique (real
+   system fonts). JS mutates this document directly on the JS thread.
+   `Session::capture_screenshot_png` captures it — this is the single source
+   of `Page.captureScreenshot`, `Page.printToPDF` (PNG raster wrapped as PDF,
+   not vector), and `Page.startScreencast` frames.
+
+2. **Heuristic layout** (`oxibrowser-core/src/css/` — estimation only):
+   tag-default style table + inline-style parsing; explicitly NOT a CSS
+   engine (no flexbox/grid/margin collapsing/media queries). Bitmap 8×16
+   font. Used only by `OXI.getBoxModelScreenshot` and approximate
+   visibility/rect estimates for CDP DOM/OXI readers.
+
+`DomSnapshot` (the read model for CDP DOM/OXI/extract) is derived from the
+live `RenderDocument` on the JS thread (`dom_snapshot::from_render_document`),
+not from a separate DOM tree — the old webapi-crate DOM is retired.
+
+> Note: the historical "Data Flow" sections below predate the Blitz
+> integration and describe the retired webapi/snapshot-mutation flow; they are
+> kept for archaeology only.
+
 ## Core Hierarchy
 
 ```
@@ -58,9 +85,9 @@ oxibrowser/
 │   │       │   ├── dom_snapshot.rs   # DomSnapshot + DomMutation
 │   │       │   ├── input.rs          # JS key/mouse/insert dispatch
 │   │       │   └── job_queue.rs      # TokioJobQueue for timers
-│   │       ├── css/
-│   │       │   ├── render.rs         # ASCII/Unicode text renderer
-│   │       │   ├── screenshot.rs     # PNG renderer + bitmap font
+│   │       ├── css/                  # Heuristic layout engine (OXI.getBoxModelScreenshot only)
+│   │       │   ├── layout.rs         # Tag-default + inline-style heuristic boxes (no flex/grid)
+│   │       │   ├── visual.rs         # Box drawing, 8×16 bitmap font, a11y role hints
 │   │       │   └── font_8x16.bin     # 8×16 bitmap font (1520 bytes)
 │   │       └── network/
 │   │           ├── client.rs         # HttpClient + intercept
@@ -85,11 +112,11 @@ oxibrowser/
 │   │           ├── page.rs           # Page domain (navigate, screenshot)
 │   │           ├── runtime.rs        # Runtime domain (evaluate)
 │   │           └── target.rs         # Target domain
-│   └── oxibrowser-webapi/  # DOM (1,587 lines)
-│       └── src/dom/
-│           ├── document.rs           # Document: parse, query, mutate
-│           ├── node.rs               # Node, NodeId, NodeType
-│           └── tree.rs               # Tree: adjacency list, DFS, BFS
+│   └── oxibrowser-render/  # Rendering (Blitz + Stylo + Taffy)
+│       └── src/
+│           ├── document.rs           # RenderDocument::from_html → Blitz BaseDocument
+│           │                         #   + Stylo restyle + Taffy layout
+│           └── paint.rs              # capture_png → anyrender/vello_cpu raster, parley fonts
 ```
 
 ## Data Flow
@@ -159,7 +186,7 @@ Client → CDP Server → Session::evaluate("document.querySelector('h1').textCo
 │                                              │
 │  ┌──────────┐  ┌──────────┐  ┌───────────┐ │
 │  │ CDP      │  │ Session  │  │ HttpClient│ │
-│  │ Server   │  │ tasks    │  │ (reqwest) │ │
+│  │ Server   │  │ tasks    │  │ (wreq)    │ │
 │  └──────────┘  └──────────┘  └───────────┘ │
 │                                              │
 │  ┌──────────────────────────────────────┐   │
@@ -216,12 +243,15 @@ fetch(url)                  HttpClient::fetch(url)
 ### Storage Bridge (localStorage)
 
 ```
-JS Thread                    Session
-────────                    ───────
-localStorage.getItem(key)   Session::local_storage
+JS Thread                    Session (async)
+────────                    ────────────────
+localStorage.getItem(k)     (read is synchronous —
+    │                        RefCell<HashMap> on the JS thread)
+localStorage.setItem(k,v)   Session::local_storage
     │                           │
-    ├── Send StorageMsg::Get ──→│
-    │←── Recv StorageValue ────┤
+    ├── LocalStorageMsg:: ────→│  handle_local_storage_sync
+    │   SetItem/RemoveItem/     │  (mpsc, one-way write sync)
+    │   Clear                   │
 ```
 
 ## Interior Mutability Strategy

@@ -264,3 +264,65 @@ fn count_page_objects(pdf: &[u8]) -> usize {
         .count();
     page - pages
 }
+
+/// `prefers-color-scheme` override: with `@media (prefers-color-scheme: dark)`
+/// styling, forcing dark (override `Some(true)`) must produce a different
+/// frame than no override (light default).
+#[test]
+fn color_scheme_override_changes_media_query_result() {
+    use oxibrowser_render::{color_scheme_override_dark, set_color_scheme_override};
+
+    const HTML: &str = r#"<html><head><style>
+      body { margin: 0; background: #ffffff; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #101010; }
+      }
+    </style></head><body><p>x</p></body></html>"#;
+
+    const VIEWPORT: Viewport = Viewport {
+        width: 64,
+        height: 64,
+        scale: 1.0,
+    };
+
+    // Guard: test assumes no override leaked in from another test.
+    assert_eq!(color_scheme_override_dark(), None);
+
+    let mut light_doc = RenderDocument::from_html(HTML, None, VIEWPORT).expect("light from_html");
+    let light_png = light_doc
+        .capture_png(&CaptureOpts::default())
+        .expect("light capture_png");
+
+    set_color_scheme_override(Some(true));
+    assert_eq!(color_scheme_override_dark(), Some(true));
+
+    let mut dark_doc = RenderDocument::from_html(HTML, None, VIEWPORT).expect("dark from_html");
+    let dark_png = dark_doc
+        .capture_png(&CaptureOpts::default())
+        .expect("dark capture_png");
+
+    set_color_scheme_override(None);
+    assert_eq!(color_scheme_override_dark(), None);
+
+    assert_ne!(light_png, dark_png, "dark override must change the frame");
+}
+
+/// Regression: a relative `<img src>` with a base_url must not panic.
+/// blitz-html resolves eager sub-resource ops (img) during parsing, so the
+/// base URL has to come from `DocumentConfig`, not the post-parse
+/// `set_base_url` call (which used to run too late).
+#[test]
+fn relative_img_with_base_url_does_not_panic() {
+    const VIEWPORT: Viewport = Viewport {
+        width: 64,
+        height: 64,
+        scale: 1.0,
+    };
+    let html = r#"<html><body><img src="pic.png"><p>hi</p></body></html>"#;
+    let mut doc = RenderDocument::from_html(html, Some("https://example.com/page.html"), VIEWPORT)
+        .expect("from_html with relative img must not panic");
+    let png = doc
+        .capture_png(&CaptureOpts::default())
+        .expect("capture_png");
+    assert!(!png.is_empty());
+}

@@ -21,7 +21,10 @@ mod paint;
 // a direct blitz-dom dependency.
 pub use blitz_dom::{BaseDocument, NodeData};
 
-pub use document::{CaptureOpts, NodeId, RenderDocument, RenderError, Viewport};
+pub use document::{
+    CaptureOpts, NodeId, RenderDocument, RenderError, Viewport, color_scheme_override_dark,
+    set_color_scheme_override,
+};
 pub use paint::blank_png;
 pub use paint::png_to_pdf;
 pub use paint::{PdfOrientation, PdfPageOptions, PdfPageSize, png_to_pdf_paged};

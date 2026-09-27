@@ -2,6 +2,19 @@
 //!
 //! All form operations use direct DOM property access + synthetic events.
 
+/// Generate JS that reports whether the currently focused element is a
+/// password input. Used by the screenshot capture guard: while a password
+/// field has focus, captures are refused so an autofilled/plaintext value
+/// can never leak into a PNG (design §7 P0-2).
+pub fn js_active_password_probe() -> String {
+    r#"(function() {
+        var el = document.activeElement;
+        return !!(el && el.tagName === 'INPUT' &&
+                  (el.getAttribute('type') || '').toLowerCase() === 'password');
+    })()"#
+        .to_string()
+}
+
 /// Generate JS to fill an input or textarea.
 pub fn js_fill(selector: &str, value: &str) -> String {
     let sel = serde_json::to_string(selector).unwrap_or_default();

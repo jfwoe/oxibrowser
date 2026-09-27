@@ -9,11 +9,10 @@
 use crate::domains;
 use crate::domains::DispatchContext;
 use crate::event::{EventReceiver, EventSender, event_channel};
-use crate::protocol::{CdpEvent, CdpRequest, CdpResponse};
+use crate::protocol::{CdpError, CdpEvent, CdpRequest, CdpResponse};
 use crate::server::MAX_CDP_MESSAGE_SIZE;
 use futures::{SinkExt, StreamExt};
 use oxibrowser_core::Browser;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite;
@@ -111,7 +110,8 @@ impl CdpSession {
         // Clone the shared dialog gate so Page.handleJavaScriptDialog can
         // resolve a pending dialog without acquiring the session lock.
         let dialog_gate = session.read().await.dialog_gate();
-        let child_targets: crate::domains::ChildTargets = Arc::new(RwLock::new(HashMap::new()));
+        let child_targets: crate::domains::ChildTargets =
+            Arc::new(crate::domains::TargetRegistry::new());
 
         info!(session_id = %session_id, "CDP session created");
 
@@ -334,7 +334,7 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
     // target, route to that session; otherwise use the default session.
     let effective_ctx = match &request.session_id {
         Some(sid) => {
-            let child = ctx.child_targets.read().await.get(sid).cloned();
+            let child = ctx.child_targets.session(sid).await;
             match child {
                 Some(child_session) => DispatchContext {
                     session: child_session,
@@ -345,6 +345,19 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
                     child_targets: ctx.child_targets.clone(),
                 },
                 None => {
+                    if ctx.child_targets.is_closed(sid) {
+                        // Closed target: fail loudly rather than silently
+                        // evaluating against the default session.
+                        return CdpResponse {
+                            id: request_id,
+                            result: None,
+                            error: Some(CdpError {
+                                code: -32001,
+                                message: "target closed".to_string(),
+                            }),
+                            session_id: session_id_for_response,
+                        };
+                    }
                     // Unknown sessionId — fall back to the default session.
                     DispatchContext {
                         session: ctx.session.clone(),

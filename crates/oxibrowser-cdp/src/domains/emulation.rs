@@ -6,7 +6,7 @@
 //! Stored metrics are kept in a module-level static so render code can read them
 //! later via [`current_device_metrics`] without round-tripping through the protocol.
 
-use crate::domains::DomainResult;
+use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
@@ -36,12 +36,15 @@ pub fn current_device_metrics() -> Option<DeviceMetrics> {
 }
 
 /// Dispatch Emulation domain methods.
-pub fn handle(method: &str, params: Option<Value>) -> DomainResult {
+pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     match method {
         "setDeviceMetricsOverride" => set_device_metrics_override(params),
         "clearDeviceMetricsOverride" => clear_device_metrics_override(),
-        "setVisibleSize" => Ok(Some(json!({}))),
-        "setUserAgentOverride" => Ok(Some(json!({}))),
+        // Deprecated/non-standard CDP (`Emulation.setVisibleSize` was never in
+        // the spec and modern Chrome rejects it) — fall through to -32601 like
+        // any other unknown method instead of silently acknowledging.
+        "setUserAgentOverride" => set_user_agent_override(params, ctx).await,
+        "setEmulatedMedia" => set_emulated_media(params, ctx).await,
         "setGeolocationOverride" => set_geolocation_override(params),
         "clearGeolocationOverride" => clear_geolocation_override(),
         "setTimezoneOverride" => set_timezone_override(params),
@@ -150,10 +153,101 @@ fn set_timezone_override(params: Option<Value>) -> DomainResult {
     Ok(Some(json!({})))
 }
 
+/// `Emulation.setUserAgentOverride` — install a per-session UA override.
+///
+/// `params.userAgent` becomes the UA on outgoing requests
+/// (`Session::RequestOverrides.user_agent`) and on the JS surface
+/// (`navigator.userAgent` + stealth profile), applied immediately via
+/// `JsRuntime::set_user_agent`. An absent/empty/null `userAgent` clears the
+/// override. `Network.setExtraHTTPHeaders` state (`extra_headers`) is
+/// preserved.
+///
+/// `platform` / `userAgentMetadata.platform` are accepted but deliberately
+/// not stored: the stealth layer derives the platform from the UA string
+/// itself (`js::stealth::ChromeProfile::from_ua`), so `navigator.platform`,
+/// `userAgentData.platform`, and the WebGL renderer stay consistent with the
+/// overridden UA without extra state.
+async fn set_user_agent_override(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let ua = params
+        .get("userAgent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let clear = ua.is_empty();
+    let ua_opt = (!clear).then(|| ua.to_string());
+
+    let mut session = ctx.session.write().await;
+    let mut overrides = session.overrides().clone();
+    overrides.user_agent = ua_opt.clone();
+    session.set_overrides(overrides);
+    session.set_js_user_agent(ua_opt);
+    drop(session);
+
+    tracing::debug!(ua = %ua, "Emulation.setUserAgentOverride");
+    Ok(Some(json!({})))
+}
+
+/// `Emulation.setEmulatedMedia` — emulate media features.
+///
+/// Only the `prefers-color-scheme` feature is honored: value `dark` maps to
+/// `Session::set_media_color_scheme(Some(true))`, `light` to `Some(false)`.
+/// The call has replace semantics — an absent/empty `features` list (or one
+/// without a usable `prefers-color-scheme` entry) clears the override.
+///
+/// Every other feature name (and unsupported `prefers-color-scheme` values)
+/// is logged with `tracing::warn!` and ignored; the response reports what
+/// was skipped as `{"ignored": [...]}`.
+///
+/// Timing: layout reflects the new scheme the next time a document is
+/// generated; `matchMedia` probes see it immediately.
+async fn set_emulated_media(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let mut scheme: Option<bool> = None;
+    let mut ignored: Vec<String> = Vec::new();
+    if let Some(features) = params.get("features").and_then(|v| v.as_array()) {
+        for feature in features {
+            let name = feature
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let value = feature
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if name == "prefers-color-scheme" {
+                match value {
+                    "dark" => scheme = Some(true),
+                    "light" => scheme = Some(false),
+                    other => {
+                        tracing::warn!(
+                            value = %other,
+                            "Emulation.setEmulatedMedia: unsupported prefers-color-scheme value ignored"
+                        );
+                        ignored.push(format!("prefers-color-scheme={other}"));
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    feature = %name,
+                    "Emulation.setEmulatedMedia: unsupported feature ignored"
+                );
+                ignored.push(name.to_string());
+            }
+        }
+    }
+    ctx.session.write().await.set_media_color_scheme(scheme);
+    Ok(Some(json!({ "ignored": ignored })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::event_channel;
+    use oxibrowser_core::network::intercept::shared_registry;
+    use oxibrowser_core::session::RequestOverrides;
+    use oxibrowser_core::{Browser, BrowserConfig};
     use serde_json::json;
+    use std::sync::Arc;
 
     // The device metrics override lives in a process-global static, so tests
     // that touch it must run serially to avoid cross-contamination when cargo
@@ -166,9 +260,27 @@ mod tests {
         TEST_LOCK.lock()
     }
 
-    #[test]
-    fn set_device_metrics_override_stores_values() {
+    /// Build a DispatchContext backed by a real Browser session.
+    async fn make_ctx() -> DispatchContext {
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        let browser = Arc::new(Browser::new(config).await.unwrap());
+        let session = browser.new_session().await.unwrap();
+        let (events, _rx) = event_channel();
+        DispatchContext {
+            session,
+            events,
+            fetch_registry: shared_registry(),
+            dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
+            browser,
+            child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_device_metrics_override_stores_values() {
         let _g = serial();
+        let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
         let params = json!({
@@ -177,7 +289,9 @@ mod tests {
             "deviceScaleFactor": 3.0,
             "mobile": true,
         });
-        let result = handle("setDeviceMetricsOverride", Some(params)).unwrap();
+        let result = handle("setDeviceMetricsOverride", Some(params), &ctx)
+            .await
+            .unwrap();
         assert_eq!(result, Some(json!({})));
 
         let stored = current_device_metrics().expect("metrics should be set");
@@ -187,9 +301,10 @@ mod tests {
         assert!(stored.mobile);
     }
 
-    #[test]
-    fn clear_device_metrics_override_returns_empty_and_clears_state() {
+    #[tokio::test]
+    async fn clear_device_metrics_override_returns_empty_and_clears_state() {
         let _g = serial();
+        let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = Some(DeviceMetrics {
             width: 100,
             height: 200,
@@ -197,15 +312,18 @@ mod tests {
             mobile: false,
         });
 
-        let result = handle("clearDeviceMetricsOverride", None).unwrap();
+        let result = handle("clearDeviceMetricsOverride", None, &ctx)
+            .await
+            .unwrap();
         assert_eq!(result, Some(json!({})));
 
         assert!(current_device_metrics().is_none());
     }
 
-    #[test]
-    fn unknown_method_returns_method_not_implemented() {
-        let result = handle("setCPUThrottlingRate", None);
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_implemented() {
+        let ctx = make_ctx().await;
+        let result = handle("setCPUThrottlingRate", None, &ctx).await;
         let err = result.expect_err("expected error");
         assert_eq!(err.code, -32601);
         assert!(
@@ -215,45 +333,216 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_visible_size_acknowledges() {
-        let result = handle("setVisibleSize", None).unwrap();
-        assert_eq!(result, Some(json!({})));
+    #[tokio::test]
+    async fn set_visible_size_is_not_implemented() {
+        // `Emulation.setVisibleSize` is non-standard and was removed from the
+        // ack list — it must fall through to the -32601 fallback.
+        let ctx = make_ctx().await;
+        let err = handle("setVisibleSize", None, &ctx)
+            .await
+            .expect_err("expected method-not-implemented");
+        assert_eq!(err.code, -32601);
     }
 
-    #[test]
-    fn set_user_agent_override_acknowledges() {
-        let params = json!({ "userAgent": "Mozilla/5.0" });
-        let result = handle("setUserAgentOverride", Some(params)).unwrap();
+    #[tokio::test]
+    async fn set_user_agent_override_updates_session_and_clears() {
+        let ctx = make_ctx().await;
+
+        // Set an override; extra headers (set out-of-band) must be preserved.
+        ctx.session.write().await.set_overrides(RequestOverrides {
+            user_agent: None,
+            extra_headers: vec![("X-Keep".to_string(), "1".to_string())],
+        });
+        let params = json!({ "userAgent": "Mozilla/5.0 (TestUA/1.0)" });
+        let result = handle("setUserAgentOverride", Some(params), &ctx)
+            .await
+            .unwrap();
         assert_eq!(result, Some(json!({})));
+
+        {
+            let session = ctx.session.read().await;
+            assert_eq!(
+                session.overrides().user_agent.as_deref(),
+                Some("Mozilla/5.0 (TestUA/1.0)")
+            );
+            assert_eq!(session.effective_ua(), "Mozilla/5.0 (TestUA/1.0)");
+            assert_eq!(
+                session.overrides().extra_headers,
+                vec![("X-Keep".to_string(), "1".to_string())]
+            );
+        }
+
+        // Empty UA clears the override but keeps extra headers; a null
+        // userAgent does the same.
+        for params in [json!({ "userAgent": "" }), json!({ "userAgent": null })] {
+            handle("setUserAgentOverride", Some(params), &ctx)
+                .await
+                .unwrap();
+            let session = ctx.session.read().await;
+            assert!(session.overrides().user_agent.is_none());
+            assert!(!session.effective_ua().is_empty());
+            assert_eq!(
+                session.overrides().extra_headers,
+                vec![("X-Keep".to_string(), "1".to_string())]
+            );
+        }
     }
 
-    #[test]
-    fn set_device_metrics_override_clamps_zero_dimensions() {
+    #[tokio::test]
+    async fn set_user_agent_override_missing_params_clears() {
+        let ctx = make_ctx().await;
+        handle(
+            "setUserAgentOverride",
+            Some(json!({ "userAgent": "UA/1" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(ctx.session.read().await.overrides().user_agent.is_some());
+
+        handle("setUserAgentOverride", None, &ctx).await.unwrap();
+        assert!(ctx.session.read().await.overrides().user_agent.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_device_metrics_override_clamps_zero_dimensions() {
         let _g = serial();
+        let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
         let params = json!({
             "width": 0u32,
             "height": 0u32,
         });
-        handle("setDeviceMetricsOverride", Some(params)).unwrap();
+        handle("setDeviceMetricsOverride", Some(params), &ctx)
+            .await
+            .unwrap();
 
         let stored = current_device_metrics().expect("metrics should be set");
         assert!(stored.width >= 1);
         assert!(stored.height >= 1);
     }
 
-    #[test]
-    fn set_device_metrics_override_applies_defaults_when_params_missing() {
+    #[tokio::test]
+    async fn set_device_metrics_override_applies_defaults_when_params_missing() {
         let _g = serial();
+        let ctx = make_ctx().await;
         *DEVICE_METRICS.write() = None;
 
-        handle("setDeviceMetricsOverride", None).unwrap();
+        handle("setDeviceMetricsOverride", None, &ctx)
+            .await
+            .unwrap();
         let stored = current_device_metrics().expect("metrics should be set");
         assert_eq!(stored.width, 1280);
         assert_eq!(stored.height, 800);
         assert_eq!(stored.device_scale_factor, 1.0);
         assert!(!stored.mobile);
+    }
+
+    // -- Emulation.setEmulatedMedia -------------------------------------
+    //
+    // The color-scheme override is a process-global (render static + JS
+    // runtime state), so these tests run under the same serial lock as the
+    // device-metrics tests.
+
+    /// Live `prefers-color-scheme: dark` state via the session's JS runtime.
+    async fn probe_dark(ctx: &DispatchContext) -> bool {
+        let result = ctx
+            .session
+            .write()
+            .await
+            .evaluate_js("matchMedia('(prefers-color-scheme: dark)').matches")
+            .await
+            .expect("probe evaluate");
+        result.value.and_then(|v| v.as_bool()).expect("bool result")
+    }
+
+    #[tokio::test]
+    async fn set_emulated_media_applies_dark_and_light() {
+        let _g = serial();
+        let ctx = make_ctx().await;
+
+        let result = handle(
+            "setEmulatedMedia",
+            Some(json!({ "features": [
+                { "name": "prefers-color-scheme", "value": "dark" },
+            ] })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Some(json!({ "ignored": [] })));
+        assert!(probe_dark(&ctx).await, "dark override flips matchMedia");
+
+        let result = handle(
+            "setEmulatedMedia",
+            Some(json!({ "features": [
+                { "name": "prefers-color-scheme", "value": "light" },
+            ] })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Some(json!({ "ignored": [] })));
+        assert!(!probe_dark(&ctx).await, "light override restores light");
+    }
+
+    #[tokio::test]
+    async fn set_emulated_media_ignores_unsupported_features() {
+        let _g = serial();
+        let ctx = make_ctx().await;
+
+        let result = handle(
+            "setEmulatedMedia",
+            Some(json!({ "features": [
+                { "name": "prefers-contrast", "value": "more" },
+                { "name": "prefers-color-scheme", "value": "no-preference" },
+            ] })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(json!({
+                "ignored": [
+                    "prefers-contrast",
+                    "prefers-color-scheme=no-preference",
+                ],
+            }))
+        );
+        // Replace semantics: no usable entry → override cleared → light.
+        assert!(!probe_dark(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn set_emulated_media_empty_or_missing_features_clear() {
+        let _g = serial();
+        let ctx = make_ctx().await;
+
+        handle(
+            "setEmulatedMedia",
+            Some(json!({ "features": [
+                { "name": "prefers-color-scheme", "value": "dark" },
+            ] })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(probe_dark(&ctx).await);
+
+        // Empty list clears.
+        let result = handle("setEmulatedMedia", Some(json!({ "features": [] })), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(json!({ "ignored": [] })));
+        assert!(
+            !probe_dark(&ctx).await,
+            "empty features clears the override"
+        );
+
+        // Missing params entirely also clears (idempotent no-op).
+        handle("setEmulatedMedia", None, &ctx).await.unwrap();
+        assert!(!probe_dark(&ctx).await);
     }
 }

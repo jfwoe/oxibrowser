@@ -102,6 +102,10 @@ pub enum SessionCommand {
     CloseAll,
     /// List tabs.
     List,
+    /// Save the active tab's storage state (cookies + localStorage) to a JSON file.
+    SaveState { path: String },
+    /// Load storage state from a JSON file into the active tab.
+    LoadState { path: String },
     /// Print help.
     Help,
     /// Exit the session.
@@ -241,6 +245,24 @@ pub fn parse_session_command(line: &str) -> Result<SessionCommand, String> {
         }
 
         "list" => Ok(SessionCommand::List),
+
+        "save-state" => {
+            if args.len() != 1 {
+                return Err("save-state <path>".into());
+            }
+            Ok(SessionCommand::SaveState {
+                path: args[0].to_string(),
+            })
+        }
+
+        "load-state" => {
+            if args.len() != 1 {
+                return Err("load-state <path>".into());
+            }
+            Ok(SessionCommand::LoadState {
+                path: args[0].to_string(),
+            })
+        }
 
         "help" => Ok(SessionCommand::Help),
 
@@ -552,6 +574,40 @@ mod tests {
     fn test_parse_help() {
         let cmd = parse_session_command("help").unwrap();
         assert_matches!(cmd, SessionCommand::Help);
+    }
+
+    #[test]
+    fn test_parse_save_state() {
+        let cmd = parse_session_command("save-state /tmp/state.json").unwrap();
+        match cmd {
+            SessionCommand::SaveState { path } => assert_eq!(path, "/tmp/state.json"),
+            _ => panic!("expected SaveState"),
+        }
+    }
+
+    #[test]
+    fn test_parse_load_state() {
+        let cmd = parse_session_command("load-state /tmp/state.json").unwrap();
+        match cmd {
+            SessionCommand::LoadState { path } => assert_eq!(path, "/tmp/state.json"),
+            _ => panic!("expected LoadState"),
+        }
+    }
+
+    #[test]
+    fn test_parse_save_state_missing_path() {
+        assert!(parse_session_command("save-state").is_err());
+    }
+
+    #[test]
+    fn test_parse_load_state_missing_path() {
+        assert!(parse_session_command("load-state").is_err());
+    }
+
+    #[test]
+    fn test_parse_state_extra_args() {
+        assert!(parse_session_command("save-state a.json b.json").is_err());
+        assert!(parse_session_command("load-state a.json b.json").is_err());
     }
 
     #[test]

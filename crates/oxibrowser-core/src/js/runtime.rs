@@ -25,8 +25,9 @@
 
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -51,6 +52,47 @@ use std::time::{Duration, Instant};
 /// Global counter for unique node IDs, avoids collisions in tight loops.
 /// Starts at 1_000_000 to stay above any parsed DOM snapshot IDs.
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1_000_000);
+
+// ── JS/DOM API coverage telemetry (#15) ────────────────────────────────────
+//
+// When [`JsRuntimeConfig::telemetry`] is on, every JS context's `window`
+// object is wrapped in a counting `Proxy` (see `TELEMETRY_WINDOW_PROXY`):
+// reads of properties the target object lacks — typically Web APIs this
+// headless engine does not implement — are counted here under their property
+// name. Exposed via `OXI.getApiGaps` (CDP) and the CLI fetch `meta.api_gaps`.
+
+/// Process-global counter of unsupported/polyfilled Web API accesses,
+/// keyed by `window` property name.
+static API_GAPS: LazyLock<Mutex<BTreeMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Record one access of the (unsupported) Web API `name`.
+///
+/// Called from the telemetry `window` `Proxy` get trap via the
+/// `globalThis.__oxi_tel` native binding; cheap enough to run on every
+/// missed property lookup.
+pub fn telemetry_record(name: &str) {
+    let mut gaps = API_GAPS.lock();
+    *gaps.entry(name.to_string()).or_insert(0) += 1;
+}
+
+/// Snapshot the recorded API gaps, sorted by count (descending; ties broken
+/// by name for determinism). Read-only: counters are **not** reset, so
+/// repeated snapshots accumulate over the process lifetime.
+pub fn telemetry_snapshot() -> Vec<(String, u64)> {
+    let mut rows: Vec<(String, u64)> = API_GAPS
+        .lock()
+        .iter()
+        .map(|(name, count)| (name.clone(), *count))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+/// Clear all recorded API gaps (test/integration convenience).
+pub fn telemetry_reset() {
+    API_GAPS.lock().clear();
+}
 
 // ── Thread-local listener registry ─────────────────────────────────────────
 // Event listeners keyed by node_id → event_type → callbacks.
@@ -454,9 +496,31 @@ enum JsCommand {
         snapshot: Box<Option<DomSnapshot>>,
         response_tx: Sender<JsResponse>,
     },
-    /// Update the page URL (for window.location).
+    /// Update the page URL (for window.location). `seed_storage` seeds the
+    /// JS-side localStorage on (re-)registration — keys already present in
+    /// the live storage are preserved, seed keys overwrite (storageState
+    /// import semantics; see `Session::import_state`).
     SetPageUrl {
         url: String,
+        seed_storage: Option<HashMap<String, String>>,
+        response_tx: Sender<JsResponse>,
+    },
+    /// Apply a `prefers-color-scheme` override (CDP-style media emulation):
+    /// updates the render-crate color-scheme static (consulted when the next
+    /// `RenderDocument` is constructed, i.e. at the next document build) and
+    /// the `globalThis.__oxi_prefer_dark` flag the `matchMedia` bootstrap
+    /// derives `(prefers-color-scheme: …)` matches from. `None` clears the
+    /// override (light default).
+    SetMediaColorScheme {
+        dark: Option<bool>,
+        response_tx: Sender<JsResponse>,
+    },
+    /// Refresh the JS-surface user agent (`navigator.userAgent` + the stealth
+    /// fingerprint profile) after a UA override change
+    /// ([`JsRuntime::set_user_agent`] / CDP `Emulation.setUserAgentOverride`).
+    /// Re-registers the main frame's window globals for immediate effect.
+    SetUserAgent {
+        user_agent: Option<String>,
         response_tx: Sender<JsResponse>,
     },
     /// Set the fetch channel so JS can make real HTTP requests.
@@ -663,6 +727,40 @@ pub enum CoreEvent {
     },
     /// `fetch` / XHR response body finished loading.
     FetchLoadingFinished { request_id: String, timestamp: f64 },
+    /// A page sub-resource (script / stylesheet / image / iframe) request
+    /// dispatched by the document loader
+    /// ([`crate::session::Session::load_sub_resources`]). Ids use the
+    /// session-monotonic `res-{n}` namespace, separate from document
+    /// requests (`req-{n}`) and JS fetches (`oxi-{n}`).
+    SubresourceFetchRequest {
+        request_id: String,
+        url: String,
+        method: String,
+        /// CDP-style resource type (`Script`, `Stylesheet`, `Image`,
+        /// `Document`).
+        resource_type: String,
+        timestamp: f64,
+    },
+    /// Page sub-resource response received.
+    SubresourceFetchResponse {
+        request_id: String,
+        url: String,
+        status: u16,
+        /// MIME type with parameters stripped (empty when absent).
+        mime_type: String,
+        /// Response body length in bytes.
+        length: u64,
+        timestamp: f64,
+    },
+    /// Page sub-resource fetch failed (network-level error — no HTTP
+    /// response was observed).
+    SubresourceFetchFailed {
+        request_id: String,
+        url: String,
+        /// Failure reason (transport error message).
+        error_text: String,
+        timestamp: f64,
+    },
     /// WebSocket frame sent or received.
     WsFrame {
         direction: WsDirection,
@@ -705,6 +803,17 @@ pub enum CoreEvent {
         save_path: String,
         /// Total bytes received.
         total_bytes: usize,
+    },
+    /// A triggered download could not be saved to disk (directory creation or
+    /// file write failed). Emitted from the navigate path alongside the
+    /// `Err` return that makes the caller fall back to rendering the body.
+    DownloadFailed {
+        /// Stable download id (CDP `GUID`).
+        guid: String,
+        /// Source URL.
+        url: String,
+        /// Failure reason (I/O error message).
+        error: String,
     },
 }
 
@@ -1083,7 +1192,7 @@ fn wait_dialog_resolution(default: DialogResult, timeout: Duration) -> DialogRes
 
 /// Format a fetch request id for CDP correlation (`"oxi-{id}"`). The same id
 /// is reused for the matching response so clients can correlate the pair.
-fn cdp_request_id(id: u64) -> String {
+pub(crate) fn cdp_request_id(id: u64) -> String {
     format!("oxi-{id}")
 }
 
@@ -1141,6 +1250,10 @@ pub struct JsRuntimeConfig {
     /// User-Agent exposed to JS (navigator.userAgent). Drives the stealth
     /// fingerprint profile — must match the UA sent over the wire.
     pub user_agent: String,
+    /// Record accesses to unsupported/polyfilled Web APIs (reads of `window`
+    /// properties the target object lacks) in the global gap counter — see
+    /// [`telemetry_record`] / [`telemetry_snapshot`]. Default `false`.
+    pub telemetry: bool,
 }
 
 impl Default for JsRuntimeConfig {
@@ -1156,8 +1269,11 @@ impl Default for JsRuntimeConfig {
             nav_script_timeout_ms: 30_000,
             viewport_width: 1280,
             viewport_height: 720,
-            user_agent: "Mozilla/5.0 (OxiBrowser/0.1.0; +https://github.com/oxios/oxibrowser)"
-                .to_string(),
+            user_agent: format!(
+                "Mozilla/5.0 (OxiBrowser/{}; +https://github.com/oxios/oxibrowser)",
+                env!("CARGO_PKG_VERSION")
+            ),
+            telemetry: false,
         }
     }
 }
@@ -1176,6 +1292,7 @@ impl From<&crate::config::BrowserConfig> for JsRuntimeConfig {
             viewport_width: config.viewport_width,
             viewport_height: config.viewport_height,
             user_agent: config.user_agent.clone(),
+            telemetry: config.telemetry,
         }
     }
 }
@@ -1228,6 +1345,7 @@ impl JsRuntime {
         let dom_dirty_clone = dom_dirty.clone();
         let viewport = (config.viewport_width, config.viewport_height);
         let user_agent = config.user_agent.clone();
+        let telemetry = config.telemetry;
         let _local_storage = Arc::new(RwLock::new(HashMap::<String, String>::new()));
         std::thread::Builder::new()
             .name("oxibrowser-js".into())
@@ -1240,6 +1358,7 @@ impl JsRuntime {
                     viewport,
                     None,
                     user_agent,
+                    telemetry,
                 );
             })
             .expect("failed to spawn JS thread");
@@ -1508,15 +1627,79 @@ impl JsRuntime {
 
     /// Update the page URL (used for window.location).
     pub fn set_page_url(&mut self, url: &str) {
+        self.set_page_url_with_storage_seed(url, None);
+    }
+
+    /// Update the page URL and (re-)seed the JS-side localStorage from an
+    /// imported [`crate::storage_state::StorageState`]: on first registration
+    /// the storage starts from the seed map; if the storage global already
+    /// exists the seed is merged into it (existing keys preserved, seed keys
+    /// overwrite). Consumed by the navigate path after
+    /// `Session::import_state`.
+    pub fn set_page_url_with_storage_seed(
+        &mut self,
+        url: &str,
+        seed_storage: Option<HashMap<String, String>>,
+    ) {
         let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
         if let Err(e) = self.cmd_tx.send(JsCommand::SetPageUrl {
             url: url.to_string(),
+            seed_storage,
             response_tx,
         }) {
             tracing::error!(error = %e, "failed to send SetPageUrl: JS thread has died");
             return;
         }
         let _ = response_rx.recv();
+    }
+
+    /// Apply a `prefers-color-scheme` override (`Some(true)` = dark,
+    /// `Some(false)` = light, `None` = clear / light default).
+    ///
+    /// Two effects:
+    /// - the render-crate color-scheme static is updated, so the next
+    ///   `RenderDocument` construction (next document build / navigation)
+    ///   lays out with the overridden scheme — a live document is NOT
+    ///   re-styled;
+    /// - `globalThis.__oxi_prefer_dark` is updated immediately, so fresh
+    ///   `matchMedia('(prefers-color-scheme: …)')` probes reflect the new
+    ///   value without a navigation.
+    pub fn set_media_color_scheme(&self, dark: Option<bool>) {
+        let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
+        if let Err(e) = self
+            .cmd_tx
+            .send(JsCommand::SetMediaColorScheme { dark, response_tx })
+        {
+            tracing::error!(error = %e, "failed to send SetMediaColorScheme: JS thread has died");
+            return;
+        }
+        let _ = response_rx.recv();
+    }
+
+    /// Set the JS-surface user agent (`navigator.userAgent` + the stealth
+    /// fingerprint profile). `Some(ua)` overrides; `None` clears back to the
+    /// configured UA.
+    ///
+    /// The override is recorded process-wide first ([`set_user_agent_override`]),
+    /// then pushed to the JS thread which re-registers the window globals for
+    /// immediate effect. If the JS thread is gone (or does not acknowledge),
+    /// the failure is logged and otherwise harmless: the recorded override is
+    /// still picked up by the next window re-registration (e.g. navigation).
+    pub fn set_user_agent(&self, ua: Option<String>) {
+        set_user_agent_override(ua.clone());
+        let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
+        if let Err(e) = self.cmd_tx.send(JsCommand::SetUserAgent {
+            user_agent: ua,
+            response_tx,
+        }) {
+            tracing::warn!(error = %e, "failed to send SetUserAgent: JS thread has died; override applies at next window registration");
+            return;
+        }
+        if response_rx.recv().is_err() {
+            tracing::warn!(
+                "SetUserAgent not acknowledged by JS thread; override applies at next window registration"
+            );
+        }
     }
 
     // ── Render façades (ship a command to the JS thread, await a response) ────
@@ -1887,6 +2070,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 ///
 /// Creates a single `Context`, registers globals, and processes commands
 /// until a `Shutdown` is received.
+#[allow(clippy::too_many_arguments)] // channel/protocol boundary: one arg per field
 fn js_thread_loop(
     cmd_rx: Receiver<JsCommand>,
     console_output: Arc<RwLock<Vec<String>>>,
@@ -1895,6 +2079,7 @@ fn js_thread_loop(
     viewport: (u32, u32),
     _fetch_tx: Option<std::sync::mpsc::Sender<FetchRequestMsg>>,
     user_agent: String,
+    telemetry: bool,
 ) {
     let fetch_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>> =
         Arc::new(RwLock::new(None));
@@ -1915,15 +2100,21 @@ fn js_thread_loop(
         &dom_dirty,
         viewport,
         "",
-        &user_agent,
+        &effective_user_agent(&user_agent),
         &fetch_tx_arc,
         &cookie_jar_arc,
         &render_doc_cell,
+        telemetry,
     );
 
     // Per-iframe execution contexts (Phase 8). Keyed by context_id (≥ 2).
     // The main frame (context_id=1) uses `ctx`/`render_doc_cell` above.
     let mut child_frames: HashMap<u32, ChildFrame> = HashMap::new();
+
+    // Current main-frame page URL, tracked so `SetUserAgent` can re-register
+    // window globals against the right URL. Kept in sync by `SetPageUrl` and
+    // `SetDocument`.
+    let mut current_page_url = String::new();
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -2014,10 +2205,11 @@ fn js_thread_loop(
                                 &dom_dirty,
                                 viewport,
                                 "",
-                                &user_agent,
+                                &effective_user_agent(&user_agent),
                                 &fetch_tx_arc,
                                 &cookie_jar_arc,
                                 &render_doc_cell,
+                                telemetry,
                             );
                             ctx = new_ctx;
                             job_queue = new_queue;
@@ -2029,10 +2221,11 @@ fn js_thread_loop(
                                 &dom_dirty,
                                 viewport,
                                 "",
-                                &user_agent,
+                                &effective_user_agent(&user_agent),
                                 &fetch_tx_arc,
                                 &cookie_jar_arc,
                                 &cf.render_doc_cell,
+                                telemetry,
                             );
                             cf.ctx = new_ctx;
                             cf.job_queue = new_queue;
@@ -2083,8 +2276,13 @@ fn js_thread_loop(
                 }
                 let _ = response_tx.send(JsResponse::Done);
             }
-            JsCommand::SetPageUrl { url, response_tx } => {
+            JsCommand::SetPageUrl {
+                url,
+                seed_storage,
+                response_tx,
+            } => {
                 set_current_origin(&url);
+                current_page_url = url.clone();
                 // Re-register window.location with the new URL
                 let snap = dom_snapshot.read();
                 let dom_snapshot_ref = dom_snapshot.clone();
@@ -2094,15 +2292,20 @@ fn js_thread_loop(
                     &dom_snapshot_ref,
                     &mutations,
                     viewport,
-                    &url,
-                    &user_agent,
+                    &url.clone(),
+                    &effective_user_agent(&user_agent),
                     &fetch_tx_arc,
                     &render_doc_cell,
+                    telemetry,
                 );
                 // Preserve localStorage across URL changes.
                 // TODO(#sop): Check same-origin before preserving localStorage.
                 // Currently preserves across all navigations, including cross-origin.
                 // In a production browser, localStorage should be scoped per-origin.
+                // The same single-origin limitation applies to imported storage
+                // state (see `Session::export_state`/`import_state`): a seed is a
+                // flat map with no origin partition, so it lands on whatever
+                // origin loads next.
                 //
                 // Only re-register localStorage if it hasn't been registered yet;
                 // otherwise the existing JS-side storage object persists across navigations
@@ -2116,16 +2319,75 @@ fn js_thread_loop(
                     .as_ref()
                     .is_none_or(|v| v.is_undefined() || v.is_null())
                 {
-                    // First time — register fresh
-                    let empty = std::collections::HashMap::new();
+                    // First time — register fresh, starting from the imported
+                    // storageState seed when one was supplied (empty otherwise)
+                    // so `getItem` sees imported values on the very first
+                    // navigation after an import.
                     register_local_storage(
                         &mut ctx,
-                        empty,
+                        seed_storage.unwrap_or_default(),
                         &dom_snapshot_ref,
                         local_storage_tx_arc.clone(),
                     );
+                } else if let Some(seed) = seed_storage {
+                    // localStorage already exists: merge the seed into it —
+                    // existing keys are preserved, seed keys overwrite
+                    // (storageState import semantics, mirroring what a real
+                    // browser does when a stored origin's entries are applied).
+                    let mut seeded = 0usize;
+                    for (k, v) in seed {
+                        seeded += 1;
+                        let snippet = format!(
+                            "try {{ localStorage.setItem({}, {}); }} catch (e) {{}}",
+                            serde_json::to_string(&k).unwrap_or_else(|_| "\"\"".to_string()),
+                            serde_json::to_string(&v).unwrap_or_else(|_| "\"\"".to_string()),
+                        );
+                        if let Err(e) = ctx.eval(Source::from_bytes(&snippet)) {
+                            tracing::warn!(error = %e, "storageState localStorage seed merge failed");
+                        }
+                    }
+                    tracing::debug!(keys = seeded, "seeded storageState into live localStorage");
                 }
                 // else: localStorage already exists, preserve it across navigation
+                let _ = response_tx.send(JsResponse::Done);
+            }
+            JsCommand::SetMediaColorScheme { dark, response_tx } => {
+                // Layout/media-query reflection happens at the NEXT document
+                // build: `RenderDocument` construction reads the override
+                // static and bakes it into the viewport, so a live document is
+                // not re-styled. The JS-side flag below takes effect
+                // immediately for `matchMedia` probes.
+                oxibrowser_render::set_color_scheme_override(dark);
+                let _ = ctx.register_global_property(
+                    js_string!("__oxi_prefer_dark"),
+                    JsValue::from(dark.unwrap_or(false)),
+                    Attribute::all(),
+                );
+                tracing::debug!(dark = ?dark, "media color scheme override updated");
+                let _ = response_tx.send(JsResponse::Done);
+            }
+            JsCommand::SetUserAgent {
+                user_agent: ua_override,
+                response_tx,
+            } => {
+                // Record the override, then re-register the main frame's
+                // window globals so `navigator.userAgent` and the stealth
+                // profile reflect the effective UA immediately. Child-frame
+                // contexts rebuild with the new UA on their next navigation.
+                *USER_AGENT_OVERRIDE.write() = ua_override;
+                let ua = effective_user_agent(&user_agent);
+                let dom_snapshot_ref = dom_snapshot.clone();
+                register_window_globals(
+                    &mut ctx,
+                    &dom_snapshot_ref,
+                    &mutations,
+                    viewport,
+                    &current_page_url,
+                    &ua,
+                    &fetch_tx_arc,
+                    &render_doc_cell,
+                    telemetry,
+                );
                 let _ = response_tx.send(JsResponse::Done);
             }
             JsCommand::SetLocalStorageChannel { tx, response_tx } => {
@@ -2175,8 +2437,9 @@ fn js_thread_loop(
                 response_tx,
             } => {
                 // The base_url (document URL) drives the page origin for CORS/Referer.
-                if let Some(ref bu) = base_url {
+                if let Some(bu) = &base_url {
                     set_current_origin(bu);
+                    current_page_url = bu.clone();
                 }
                 let vp = Viewport {
                     width: viewport.0.max(64),
@@ -2336,10 +2599,11 @@ fn js_thread_loop(
                     &dom_dirty,
                     vp,
                     &base_url,
-                    &user_agent,
+                    &effective_user_agent(&user_agent),
                     &fetch_tx_arc,
                     &cookie_jar_arc,
                     &child_render_doc,
+                    telemetry,
                 );
                 // Build the child frame's RenderDocument + run scripts.
                 let boar_vp = Viewport {
@@ -3439,6 +3703,7 @@ fn create_context(
     fetch_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>>,
     cookie_jar_arc: &Arc<RwLock<Option<Arc<RwLock<CookieJar>>>>>,
     render_doc_cell: &Rc<RefCell<Option<RenderDocument>>>,
+    telemetry: bool,
 ) -> (Context, Rc<TokioJobQueue>) {
     let job_queue = Rc::new(TokioJobQueue::new());
     let mut context = Context::builder()
@@ -4341,6 +4606,21 @@ fn create_context(
 
     // --- Window global ---
 
+    // Telemetry (#15): expose the gap recorder to the `window` Proxy get
+    // trap before the window object is built (see
+    // `register_window_globals` / `TELEMETRY_WINDOW_PROXY`).
+    if telemetry {
+        let tel_fn = unsafe {
+            NativeFunction::from_closure(move |_this, args, _ctx| {
+                if let Some(v) = args.first().and_then(JsValue::as_string) {
+                    telemetry_record(&v.to_std_string_escaped());
+                }
+                Ok(JsValue::undefined())
+            })
+        };
+        let _ = context.register_global_callable(js_string!("__oxi_tel"), 1, tel_fn);
+    }
+
     register_window_globals(
         &mut context,
         dom_snapshot,
@@ -4350,6 +4630,7 @@ fn create_context(
         user_agent,
         fetch_tx_arc,
         render_doc_cell,
+        telemetry,
     );
 
     // --- atob / btoa (Base64) ---
@@ -9715,12 +9996,75 @@ fn error_sink_details(
 }
 
 // ---------------------------------------------------------------------------
+// JS user-agent override
+// ---------------------------------------------------------------------------
+
+/// Process-wide JS user-agent override (CDP `Emulation.setUserAgentOverride`
+/// via [`JsRuntime::set_user_agent`]). When `Some`, it replaces the configured
+/// UA for `navigator.userAgent` and the stealth fingerprint profile at the
+/// next window (re-)registration. The wire UA override lives separately in
+/// `Session::RequestOverrides`; the CDP layer sets both together so the JS
+/// surface and outgoing requests agree.
+static USER_AGENT_OVERRIDE: std::sync::LazyLock<parking_lot::RwLock<Option<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Set the JS-surface user-agent override; `None` clears it back to the
+/// configured UA. The value is reflected when the window globals are
+/// (re-)registered — at the next `SetPageUrl` (navigation) or immediately via
+/// the `SetUserAgent` command.
+pub fn set_user_agent_override(ua: Option<String>) {
+    *USER_AGENT_OVERRIDE.write() = ua;
+}
+
+/// Effective JS-surface UA: the override if set, else `configured`.
+fn effective_user_agent(configured: &str) -> String {
+    USER_AGENT_OVERRIDE
+        .read()
+        .clone()
+        .unwrap_or_else(|| configured.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // `window` global object
-#[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------------------
+
+/// JS bootstrap that wraps `globalThis.window` in a telemetry `Proxy`
+/// (#15, design A — boa 0.20 supports the `Proxy` builtin).
+///
+/// The `get` trap forwards every access unchanged via `Reflect.get`; when
+/// the property is missing from the target object (an unimplemented Web
+/// API), the access is counted through the `__oxi_tel` global registered in
+/// [`create_context`]. Only string property names are counted — symbol
+/// probes (`Symbol.toPrimitive`, …) are ignored — and errors inside the
+/// trap are swallowed: telemetry must never break page JS. Only the `get`
+/// trap is installed, so `in` checks, enumeration, and writes behave
+/// exactly as on the unwrapped window.
+const TELEMETRY_WINDOW_PROXY: &str = r#"
+(function () {
+  var w = globalThis.window;
+  if (!w || typeof Proxy !== 'function') return;
+  globalThis.window = new Proxy(w, {
+    get: function (t, p, r) {
+      if (typeof p === 'string' && !Reflect.has(t, p) &&
+          typeof __oxi_tel === 'function') {
+        try { __oxi_tel(p); } catch (e) { /* never break page JS */ }
+      }
+      return Reflect.get(t, p, r);
+    }
+  });
+})();
+"#;
+
 /// Register `window` global object with browser property stubs.
 ///
 /// This makes `typeof window === 'object'` true and provides common
 /// properties that most JS libraries expect.
+///
+/// With `telemetry` on, the freshly built window object is additionally
+/// wrapped in the [`TELEMETRY_WINDOW_PROXY`] counting `Proxy` and the same
+/// wrapped instance is registered as both `window` and `self` (so
+/// `window === self` still holds).
+#[allow(clippy::too_many_arguments)]
 fn register_window_globals(
     ctx: &mut Context,
     dom_snapshot: &Arc<RwLock<Option<DomSnapshot>>>,
@@ -9730,6 +10074,7 @@ fn register_window_globals(
     user_agent: &str,
     fetch_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>>,
     render_doc_cell: &Rc<RefCell<Option<RenderDocument>>>,
+    telemetry: bool,
 ) {
     let _ = fetch_tx_arc; // suppress unused warning
     let url_owned = page_url.to_string();
@@ -10169,17 +10514,22 @@ fn register_window_globals(
         JsValue::from(window_final.clone()),
         Attribute::all(),
     );
+    // With telemetry on, both globals are re-registered below (after the
+    // history/location bootstrap) to share the counting-Proxy instance —
+    // see the TELEMETRY_WINDOW_PROXY install. Registering window_final here
+    // keeps the no-telemetry shape and gives the bootstraps a window to
+    // mirror onto.
+    let _ = ctx.register_global_property(
+        js_string!("self"),
+        JsValue::from(window_final.clone()),
+        Attribute::all(),
+    );
     // Register getComputedStyle as a standalone global before moving window_final
     let gcs_fn_val = window_final
         .get(js_string!("getComputedStyle"), ctx)
         .unwrap_or(JsValue::undefined());
     let _ =
         ctx.register_global_property(js_string!("getComputedStyle"), gcs_fn_val, Attribute::all());
-    let _ = ctx.register_global_property(
-        js_string!("self"),
-        JsValue::from(window_final),
-        Attribute::all(),
-    );
 
     // Also register navigator and location as standalone globals (browser spec)
     let _ = ctx.register_global_property(
@@ -10497,12 +10847,35 @@ fn register_window_globals(
     let _ = ctx.register_global_callable(js_string!("__oxiReload"), 0, reload_fn);
 
     let page_url_json = serde_json::to_string(page_url).unwrap_or_else(|_| "\"\"".to_string());
+    // prefers-color-scheme override for the matchMedia bootstrap below: the
+    // flag is re-derived from the render-crate static on every (re-)registration
+    // so the value stays fresh, and `SetMediaColorScheme` also pokes it
+    // directly for immediate effect without a navigation.
+    let prefer_dark = oxibrowser_render::color_scheme_override_dark().unwrap_or(false);
+    let _ = ctx.register_global_property(
+        js_string!("__oxi_prefer_dark"),
+        JsValue::from(prefer_dark),
+        Attribute::all(),
+    );
     let bootstrap = HISTORY_LOCATION_BOOTSTRAP.replace("/*PAGE_URL*/", &page_url_json);
     if let Err(e) = ctx.eval(Source::from_bytes(&bootstrap)) {
         tracing::warn!(error = %e, "history/location bootstrap failed");
     }
     if let Err(e) = ctx.eval(Source::from_bytes(OBSERVER_BOOTSTRAP)) {
         tracing::warn!(error = %e, "observer bootstrap failed");
+    }
+    // Telemetry (#15): install the counting `Proxy` AFTER the
+    // history/location bootstrap — it replaces the `window` global with a
+    // plain-object copy (`Object.assign({}, window, { location })`), which
+    // would discard an earlier wrap and break `window === self`. The same
+    // wrapped instance is registered as both `window` and `self`.
+    if telemetry {
+        if let Err(e) = ctx.eval(Source::from_bytes(TELEMETRY_WINDOW_PROXY)) {
+            tracing::warn!(error = %e, "telemetry window proxy wrap failed");
+        }
+        if let Ok(wrapped) = ctx.global_object().get(js_string!("window"), ctx) {
+            let _ = ctx.register_global_property(js_string!("self"), wrapped, Attribute::all());
+        }
     }
     {
         let tz =
@@ -11349,13 +11722,15 @@ fn register_window_globals(
     globalThis.window.dispatchEvent = globalThis.window.dispatchEvent || globalThis.dispatchEvent;
   }
    // window.matchMedia — minimal MediaQueryList. 'matches' is derived for
-  // common min/max-width queries against the viewport; other queries
-  // (prefers-color-scheme, hover, ...) default to false. Many SPAs only need
+  // common min/max-width queries against the viewport, and for
+  // prefers-color-scheme from globalThis.__oxi_prefer_dark (set by the
+  // runtime from the render-crate override; see SetMediaColorScheme).
+  // Other queries (hover, ...) default to false. Many SPAs only need
   // matchMedia to EXIST and not throw (responsive/CSS-in-JS feature checks).
   (function () {
     // window.matchMedia — minimal MediaQueryList. 'matches' is derived for
-    // common min/max-width queries against the viewport; other queries
-    // (prefers-color-scheme, hover, ...) default to false. Many SPAs only
+    // common min/max-width queries against the viewport, and for
+    // prefers-color-scheme from globalThis.__oxi_prefer_dark. Many SPAs only
     // need matchMedia to EXIST and not throw (responsive/CSS-in-JS checks).
     // NOTE: `window` is a distinct object from globalThis here, so install on
     // both so `window.matchMedia` and bare `matchMedia` both resolve.
@@ -11364,12 +11739,18 @@ fn register_window_globals(
       var w = (globalThis.innerWidth || (globalThis.window && globalThis.window.innerWidth) || 1280);
       var min = /min-width:\s*(\d+)/i.exec(q);
       var max = /max-width:\s*(\d+)/i.exec(q);
+      var pcs = /prefers-color-scheme:\s*(dark|light)/i.exec(q);
       var m = false;
-      if (min || max) {
+      if (pcs) {
+        var preferDark = !!globalThis.__oxi_prefer_dark;
+        m = (String(pcs[1]).toLowerCase() === 'dark') ? preferDark : !preferDark;
+      } else if (min || max) {
         m = true;
         if (min && w < parseInt(min[1], 10)) m = false;
         if (max && w > parseInt(max[1], 10)) m = false;
       }
+      // No change-event support: MediaQueryList change listeners are out of
+      // scope (media emulation here only affects fresh `matchMedia` probes).
       return { media: q, matches: m, onchange: null,
         addListener: function () {}, removeListener: function () {},
         addEventListener: function () {}, removeEventListener: function () {},
@@ -11657,6 +12038,139 @@ mod tests {
     use crate::frame::Frame;
     use crate::js::dom_snapshot::{ExecuteTiming, ScriptKind};
     use url::Url;
+
+    // --- JS/DOM API coverage telemetry (#15) ---
+
+    /// Design A prerequisite smoke: boa 0.20 must support the `Proxy`
+    /// builtin, or the telemetry window wrap has to fall back to design B
+    /// (polyfill call counters). Also proves a JS-level `get` trap runs.
+    #[tokio::test]
+    async fn test_proxy_builtin_smoke() {
+        let mut rt = JsRuntime::new();
+        let r = rt
+            .evaluate(
+                "(function () { \
+                   var p = new Proxy({}, { get: function () { return 1; } }); \
+                   return { type: typeof p, trapped: p.anything }; \
+                 })()",
+            )
+            .await
+            .expect("Proxy smoke eval");
+        if r.value.is_none() {
+            panic!("Proxy smoke failed: {:?}", r.exception);
+        }
+        let obj = r.value.expect("json object");
+        assert_eq!(obj["type"], serde_json::json!("object"), "typeof proxy");
+        assert_eq!(obj["trapped"], serde_json::json!(1), "get trap invoked");
+    }
+
+    /// Full telemetry path: with `telemetry: true`, the `window` global is a
+    /// Proxy whose get trap counts reads of missing properties. Identity
+    /// invariants (`window === self`, `typeof window === 'object'`) must
+    /// survive the wrap, and existing properties must NOT be counted.
+    /// Snapshot ordering (count-descending) is verified on the same
+    /// process-global counter with unique probe names — this is the only
+    /// test that records, so no cross-test interference is possible.
+    #[tokio::test]
+    async fn test_telemetry_window_proxy_records_api_gaps() {
+        telemetry_reset();
+
+        let cfg = JsRuntimeConfig {
+            telemetry: true,
+            ..JsRuntimeConfig::default()
+        };
+        let mut rt = JsRuntime::with_config(cfg);
+
+        // Identity + missing-prop access through the wrapped window.
+        let r = rt
+            .evaluate(
+                "(function () { \
+                   var miss1 = window.__oxi_gap_probe_a__; \
+                   var miss2 = self.__oxi_gap_probe_b__; \
+                   self.__oxi_gap_probe_b__; \
+                   return { \
+                     same: window === self, \
+                     type: typeof window, \
+                     telType: typeof __oxi_tel, \
+                     miss1: miss1 === undefined, \
+                     hasB: '__oxi_gap_probe_b__' in window \
+                   }; \
+                 })()",
+            )
+            .await
+            .expect("telemetry probe eval");
+        if r.value.is_none() {
+            panic!("telemetry probe failed: {:?}", r.exception);
+        }
+        let obj = r.value.expect("json object");
+        assert_eq!(obj["same"], serde_json::json!(true), "window === self");
+        assert_eq!(
+            obj["type"],
+            serde_json::json!("object"),
+            "typeof window === 'object'"
+        );
+        assert_eq!(
+            obj["miss1"],
+            serde_json::json!(true),
+            "missing prop reads as undefined (get trap forwards)"
+        );
+        assert_eq!(
+            obj["hasB"],
+            serde_json::json!(false),
+            "get trap must not materialize the missing property"
+        );
+
+        let snap = telemetry_snapshot();
+        let find = |name: &str| {
+            snap.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| *c)
+                .unwrap_or(0)
+        };
+        assert_eq!(find("__oxi_gap_probe_a__"), 1, "single access counted once");
+        assert_eq!(
+            find("__oxi_gap_probe_b__"),
+            2,
+            "two accesses counted, via window and self aliases"
+        );
+
+        // Supported properties must not be recorded.
+        let _ = rt
+            .evaluate("window.innerWidth; window.navigator.userAgent")
+            .await;
+        assert_eq!(
+            find("innerWidth"),
+            0,
+            "existing window properties are not gaps"
+        );
+
+        // Snapshot ordering: count-descending with deterministic name
+        // tie-break. Uses names that sort after the probes above only via
+        // counts — order of the three entries must be c (3), then a2/b2 (1).
+        telemetry_record("__oxi_order_a__");
+        telemetry_record("__oxi_order_c__");
+        telemetry_record("__oxi_order_c__");
+        telemetry_record("__oxi_order_c__");
+        telemetry_record("__oxi_order_b__");
+
+        let names: Vec<String> = telemetry_snapshot()
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("__oxi_order_"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "__oxi_order_c__".to_string(),
+                "__oxi_order_a__".to_string(),
+                "__oxi_order_b__".to_string()
+            ],
+            "snapshot sorted by count descending, name-ascending on ties"
+        );
+
+        telemetry_reset();
+        assert!(telemetry_snapshot().is_empty(), "reset clears the map");
+    }
 
     // --- Render façades (RenderDocument on the JS thread) ---
 
@@ -11970,6 +12484,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_media_color_scheme_toggles_match_media() {
+        // (#12) SetMediaColorScheme must (a) update the render override static
+        // and (b) refresh __oxi_prefer_dark so fresh matchMedia probes reflect
+        // the new scheme immediately, without a navigation.
+        let mut rt = JsRuntime::new();
+        rt.set_page_url("https://example.com/");
+        let probe = "(function () { return { \
+                     dark: matchMedia('(prefers-color-scheme: dark)').matches, \
+                     light: matchMedia('(prefers-color-scheme: light)').matches, \
+                     narrow: matchMedia('(max-width: 1280px)').matches }; })()";
+
+        // Default: no override → light.
+        let r = rt.evaluate(probe).await.expect("probe");
+        let o = r.value.expect("object");
+        assert_eq!(
+            o["dark"],
+            serde_json::json!(false),
+            "unset override = light"
+        );
+        assert_eq!(o["light"], serde_json::json!(true));
+        assert_eq!(
+            o["narrow"],
+            serde_json::json!(true),
+            "width logic untouched (1280 <= 1280)"
+        );
+
+        // Dark override.
+        rt.set_media_color_scheme(Some(true));
+        let r = rt.evaluate(probe).await.expect("probe");
+        let o = r.value.expect("object");
+        assert_eq!(
+            o["dark"],
+            serde_json::json!(true),
+            "override flips dark probes"
+        );
+        assert_eq!(o["light"], serde_json::json!(false));
+        assert_eq!(o["narrow"], serde_json::json!(true));
+
+        // Light override.
+        rt.set_media_color_scheme(Some(false));
+        let r = rt.evaluate(probe).await.expect("probe");
+        let o = r.value.expect("object");
+        assert_eq!(o["dark"], serde_json::json!(false));
+        assert_eq!(o["light"], serde_json::json!(true));
+
+        // Clear → back to light default; the render static is cleared too.
+        rt.set_media_color_scheme(None);
+        assert_eq!(
+            oxibrowser_render::color_scheme_override_dark(),
+            None,
+            "clearing removes the render override (next document builds light)"
+        );
+        let r = rt.evaluate(probe).await.expect("probe");
+        let o = r.value.expect("object");
+        assert_eq!(o["dark"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
     async fn test_match_media_min_max_width_and_default() {
         // matchMedia must exist and not throw (responsive/CSS-in-JS feature
         // checks call it at module init). min/max-width derive from viewport;
@@ -12011,7 +12583,7 @@ mod tests {
         assert_eq!(
             obj["dark"],
             serde_json::json!(false),
-            "non-width query defaults to false"
+            "prefers-color-scheme derives from the override; unset = light = false"
         );
         assert_eq!(
             obj["media"],
@@ -13053,6 +13625,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_user_agent_overrides_navigator_immediately() {
+        let mut config = JsRuntimeConfig::default();
+        config.user_agent = "ConfigUA/1.0".to_string();
+        let mut rt = JsRuntime::with_config(config);
+
+        let before = rt.evaluate("navigator.userAgent").await.unwrap();
+        assert_eq!(before.value, Some(Value::String("ConfigUA/1.0".into())));
+
+        // Override — reflected immediately on the main context (window
+        // globals re-registered by the SetUserAgent command).
+        rt.set_user_agent(Some("OverrideUA/2.0".to_string()));
+        let after = rt.evaluate("navigator.userAgent").await.unwrap();
+        assert_eq!(after.value, Some(Value::String("OverrideUA/2.0".into())));
+
+        // Clear — back to the configured UA.
+        rt.set_user_agent(None);
+        let cleared = rt.evaluate("navigator.userAgent").await.unwrap();
+        assert_eq!(cleared.value, Some(Value::String("ConfigUA/1.0".into())));
+    }
+
+    #[tokio::test]
     async fn test_evaluate_after_infinite_recursion() {
         // After infinite recursion error, the runtime should still work
         let mut rt = JsRuntime::new();
@@ -13109,6 +13702,7 @@ mod tests {
             viewport_width: 1280,
             viewport_height: 720,
             user_agent: "Test/1.0".to_string(),
+            telemetry: false,
         };
         let mut rt = JsRuntime::with_config(config);
 

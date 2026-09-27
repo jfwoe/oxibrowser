@@ -9,20 +9,122 @@ use crate::error::{CoreError, Result};
 use crate::frame::Frame;
 use crate::frame::FrameId;
 use crate::js::JsRuntime;
-use crate::js::dom_snapshot::DomMutation;
+use crate::js::dom_snapshot::{DomMutation, ExecuteTiming, ScriptKind, ScriptSource};
 use crate::js::runtime::JsRuntimeConfig;
 use crate::js::runtime::{FetchRequestMsg, FetchResponseMsg, LocalStorageMsg, WsReqMsg};
 use crate::network::HttpClient;
 use crate::network::cookie::CookieJar;
+use crate::network::har;
 use crate::network::ws::{WsCmd, WsEvent, run_ws_connection};
 use crate::page::Page;
 use parking_lot::RwLock;
 use percent_encoding::percent_decode_str;
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tracing::info;
 use url::Url;
+
+/// Maximum entries retained in the per-session request log (oldest evicted).
+const NETWORK_LOG_CAP: usize = 500;
+/// POST bodies larger than this are truncated in the request log; the
+/// `post_body_truncated` flag marks the cut.
+const POST_BODY_CAP: usize = 64 * 1024;
+
+/// Error message used when a capture is refused by the password-focus guard
+/// ([`Session::capture_screenshot_png`]). CDP callers match on this to
+/// propagate the refusal instead of their blank-PNG fallback.
+pub const CAPTURE_BLOCKED_MSG: &str = "screenshot blocked: a password input has focus";
+
+/// One recorded HTTP request/response pair, kept in the per-session rolling
+/// request log ([`Session::network_log_snapshot`]) and serializable to HAR
+/// ([`crate::network::har::to_har_json`]).
+#[derive(Serialize, Clone, Debug)]
+pub struct RequestRecord {
+    /// Session-namespace request id: `req-{n}` (document fetches),
+    /// `res-{n}` (sub-resources), or `oxi-{n}` (JS fetch bridge).
+    pub request_id: String,
+    /// Request URL.
+    pub url: String,
+    /// HTTP method.
+    pub method: String,
+    /// CDP-style resource type (`Document`, `Script`, `Stylesheet`, `Image`,
+    /// `Fetch`).
+    pub resource_type: String,
+    /// Request headers as sent/forwarded (best effort — client defaults are
+    /// applied inside the transport and not all are observable here).
+    pub request_headers: Vec<(String, String)>,
+    /// Request body (POST), capped at [`POST_BODY_CAP`] bytes.
+    pub post_body: Option<Vec<u8>>,
+    /// Whether [`RequestRecord::post_body`] was cut at the cap.
+    pub post_body_truncated: bool,
+    /// Response status; `None` while in flight or on transport failure.
+    pub status: Option<u16>,
+    /// Response headers.
+    pub response_headers: Vec<(String, String)>,
+    /// Response MIME type with parameters stripped (empty when absent).
+    pub mime_type: String,
+    /// Request dispatch time (ms since the Unix epoch).
+    pub started_at_ms: f64,
+    /// Response completion time; `None` while in flight.
+    pub finished_at_ms: Option<f64>,
+    /// Always `false` — the session performs no response caching, so nothing
+    /// can be served from cache.
+    pub from_cache: bool,
+    /// Response body length in bytes when the body was read; `None` when
+    /// unknown (transport failure, body not read).
+    pub response_body_length: Option<u64>,
+}
+
+/// Wall-clock timestamp in milliseconds since the Unix epoch.
+fn unix_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Append a record to the shared log, evicting the oldest entry past the cap.
+/// Free-standing so the background fetch bridge thread can share it.
+fn record_request_start(log: &parking_lot::Mutex<VecDeque<RequestRecord>>, record: RequestRecord) {
+    let mut log = log.lock();
+    if log.len() >= NETWORK_LOG_CAP {
+        log.pop_front();
+    }
+    log.push_back(record);
+}
+
+/// Complete the newest record with the given id (status/headers/length).
+/// Free-standing so the background fetch bridge thread can share it.
+#[allow(clippy::too_many_arguments)]
+fn record_request_finish(
+    log: &parking_lot::Mutex<VecDeque<RequestRecord>>,
+    request_id: &str,
+    status: Option<u16>,
+    response_headers: Vec<(String, String)>,
+    mime_type: String,
+    response_body_length: Option<u64>,
+) {
+    let mut log = log.lock();
+    if let Some(record) = log.iter_mut().rev().find(|r| r.request_id == request_id) {
+        record.status = status;
+        record.response_headers = response_headers;
+        record.mime_type = mime_type;
+        record.response_body_length = response_body_length;
+        record.finished_at_ms = Some(unix_ms());
+    }
+}
+
+/// Cap a POST body for logging, returning the (possibly cut) bytes and the
+/// truncation flag.
+fn cap_post_body(body: Option<Vec<u8>>) -> (Option<Vec<u8>>, bool) {
+    match body {
+        Some(bytes) if bytes.len() > POST_BODY_CAP => (Some(bytes[..POST_BODY_CAP].to_vec()), true),
+        other => (other, false),
+    }
+}
 
 /// Unique session ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,6 +149,23 @@ pub struct CapturedResponse {
     pub body: String,
     pub base64: bool,
     pub content_type: String,
+}
+
+/// Per-session request overrides applied to every document/sub-resource/POST
+/// fetch the Session performs (`RequestOverrides.user_agent` replaces the
+/// wire UA; `extra_headers` are appended after the default headers, except
+/// transport-managed names — see
+/// [`crate::network::client::is_transport_managed_header`]).
+///
+/// Populated from the CDP layer via `Emulation.setUserAgentOverride` and
+/// `Network.setExtraHTTPHeaders`; read back through [`Session::overrides`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestOverrides {
+    /// Replaces the configured UA on outgoing requests (and, when set, on the
+    /// JS surface via the runtime's UA override). `None` = use config UA.
+    pub user_agent: Option<String>,
+    /// Extra headers appended to every Session-issued request.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// A browsing session with its own history, storage, and pages.
@@ -112,6 +231,39 @@ pub struct Session {
     frame_contexts: parking_lot::RwLock<HashMap<String /* "frame-N" */, u32 /* context_id */>>,
     /// Next child execution-context id to assign (starts at 2; main=1).
     next_context_id: std::sync::atomic::AtomicU32,
+    /// Per-session request overrides (UA + extra headers), threaded into every
+    /// Session-issued fetch. Shared as `Arc` so the background fetch bridge
+    /// thread observes mutations made via `set_overrides` (CDP
+    /// `Emulation.setUserAgentOverride` / `Network.setExtraHTTPHeaders`).
+    /// Session code snapshots (clones) the value before each request rather
+    /// than holding the guard across `await`.
+    overrides: Arc<parking_lot::RwLock<RequestOverrides>>,
+    /// Monotonic counter backing document/page request ids (`req-{n}`) —
+    /// response-body keys and request-log ids for navigations.
+    next_request_id: AtomicU64,
+    /// Monotonic counter backing sub-resource request ids (`res-{n}`) used by
+    /// the sub-resource request log + `SubresourceFetch*` events.
+    next_resource_id: AtomicU64,
+    /// Rolling request log (capped at [`NETWORK_LOG_CAP`] entries) covering
+    /// document navigations, sub-resource fetches, and JS-issued fetches.
+    /// Shared as `Arc` so the background fetch bridge thread records into the
+    /// same log; exported via [`Session::network_log_snapshot`] and
+    /// [`crate::network::har::to_har_json`].
+    network_log: Arc<parking_lot::Mutex<VecDeque<RequestRecord>>>,
+    /// Offline emulation flag (CDP `Network.emulateNetworkConditions`). Shared
+    /// as `Arc` so the background fetch bridge rejects JS-issued requests
+    /// while offline, without holding `&Session`.
+    offline: Arc<AtomicBool>,
+    /// Registered init scripts `(id, source)`, run before every page's own
+    /// scripts on each document injection (Playwright `addInitScript`).
+    /// Managed via [`Session::add_init_script`] / [`Session::remove_init_script`].
+    init_scripts: Vec<(String, String)>,
+    /// Monotonic counter backing init-script ids (`"init-N"`, per session).
+    init_script_counter: u64,
+    /// localStorage snapshot stashed by [`Session::import_state`] and handed
+    /// to the next `SetPageUrl` (i.e. the next document injection), which
+    /// seeds the JS-side storage and then drops it.
+    pending_seed: Option<HashMap<String, String>>,
 }
 
 /// Configurable download directory for `Content-Disposition: attachment`
@@ -337,6 +489,7 @@ fn current_time_ms() -> f64 {
 /// task on every terminal branch — including the error/early-return paths — so
 /// the counter never leaks and `wait_for_condition(NetworkIdle)` observes real
 /// parallelism.
+#[allow(clippy::too_many_arguments)] // channel/protocol boundary: one arg per field
 fn handle_fetch_requests(
     fetch_rx: std::sync::mpsc::Receiver<FetchRequestMsg>,
     response_tx: std::sync::mpsc::Sender<FetchResponseMsg>,
@@ -347,6 +500,9 @@ fn handle_fetch_requests(
     event_tx: std::sync::Arc<
         parking_lot::RwLock<Option<std::sync::mpsc::Sender<crate::js::CoreEvent>>>,
     >,
+    offline: Arc<AtomicBool>,
+    network_log: Arc<parking_lot::Mutex<VecDeque<RequestRecord>>>,
+    overrides: Arc<parking_lot::RwLock<RequestOverrides>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -374,6 +530,9 @@ fn handle_fetch_requests(
                     let response_tx = response_tx.clone();
                     let in_flight = in_flight.clone();
                     let event_tx = event_tx.clone();
+                    let offline = offline.clone();
+                    let network_log = network_log.clone();
+                    let overrides = overrides.clone();
 
                     // Spawn an independent task per request so concurrent
                     // fetches run in parallel (Phase 3), not one-at-a-time.
@@ -385,7 +544,69 @@ fn handle_fetch_requests(
                         let origin = request.origin;
                         let url_str = request.url;
 
+                        // Request-log entry for this JS-issued fetch. The id
+                        // namespace matches the CDP `Network.requestWillBeSent`
+                        // events minted on the JS thread (`oxi-{n}`).
+                        let record_id = crate::js::runtime::cdp_request_id(id);
+                        let (post_body, post_body_truncated) = cap_post_body(body.clone());
+                        record_request_start(
+                            &network_log,
+                            RequestRecord {
+                                request_id: record_id.clone(),
+                                url: url_str.clone(),
+                                method: method.clone(),
+                                resource_type: "Fetch".to_string(),
+                                request_headers: headers.clone(),
+                                post_body,
+                                post_body_truncated,
+                                status: None,
+                                response_headers: Vec::new(),
+                                mime_type: String::new(),
+                                started_at_ms: unix_ms(),
+                                finished_at_ms: None,
+                                // No response cache exists — nothing can come
+                                // from cache.
+                                from_cache: false,
+                                response_body_length: None,
+                            },
+                        );
+                        // Snapshot the overrides (UA + extra headers) so this
+                        // request carries exactly what was set at dispatch
+                        // time, without holding the lock across awaits.
+                        let ov = overrides.read().clone();
+
+                        let fail_record =
+                            |network_log: &Arc<parking_lot::Mutex<VecDeque<RequestRecord>>>,
+                             status: Option<u16>| {
+                                record_request_finish(
+                                    network_log,
+                                    &record_id,
+                                    status,
+                                    Vec::new(),
+                                    String::new(),
+                                    None,
+                                );
+                            };
+
+                        // Offline emulation: reject JS-issued requests before
+                        // any network I/O (mirrors the document path check).
+                        if offline.load(Ordering::Relaxed) {
+                            fail_record(&network_log, None);
+                            let _ = response_tx.send(FetchResponseMsg {
+                                id,
+                                status: 0,
+                                status_text: "Network Error".to_string(),
+                                url: url_str,
+                                headers: vec![],
+                                body: String::new(),
+                                error: Some("offline".to_string()),
+                            });
+                            in_flight.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+
                         if Url::parse(&url_str).is_err() {
+                            fail_record(&network_log, Some(400));
                             let _ = response_tx.send(FetchResponseMsg {
                                 id,
                                 status: 400,
@@ -404,6 +625,7 @@ fn handle_fetch_requests(
                             maybe_intercept(&event_tx, id, &url_str, &method, &headers).await;
                         let resp = match decision {
                             InterceptDecision::Respond(msg) => {
+                                fail_record(&network_log, Some(msg.status));
                                 let _ = response_tx.send(msg);
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
                                 return;
@@ -414,12 +636,13 @@ fn handle_fetch_requests(
                                 headers,
                             } => {
                                 http_client
-                                    .request_with_context(
+                                    .request_with_context_with_overrides(
                                         &url,
                                         &method,
                                         &headers,
                                         body,
                                         origin.as_deref(),
+                                        Some(&ov),
                                     )
                                     .await
                             }
@@ -440,21 +663,18 @@ fn handle_fetch_requests(
                                         (k.to_string(), v.to_str().unwrap_or("").to_string())
                                     })
                                     .collect();
-                                let body =
+                                let mime_type = headers
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                                    .map(|(_, v)| HttpClient::mime_without_params(v))
+                                    .unwrap_or_default();
+                                let (resp_body, truncated) =
                                     match HttpClient::read_body_limited(response, max_body_bytes)
                                         .await
                                     {
-                                        Ok((buf, truncated)) => {
-                                            if truncated {
-                                                tracing::warn!(
-                                                    url = %resp_url,
-                                                    max_bytes = max_body_bytes,
-                                                    "fetch body truncated"
-                                                );
-                                            }
-                                            String::from_utf8_lossy(&buf).into_owned()
-                                        }
+                                        Ok((buf, truncated)) => (buf, truncated),
                                         Err(e) => {
+                                            fail_record(&network_log, Some(status));
                                             let _ = response_tx.send(FetchResponseMsg {
                                                 id,
                                                 status,
@@ -468,6 +688,24 @@ fn handle_fetch_requests(
                                             return;
                                         }
                                     };
+                                if truncated {
+                                    tracing::warn!(
+                                        url = %resp_url,
+                                        max_bytes = max_body_bytes,
+                                        "fetch body truncated"
+                                    );
+                                }
+                                let body_len = resp_body.len() as u64;
+                                let body = String::from_utf8_lossy(&resp_body).into_owned();
+
+                                record_request_finish(
+                                    &network_log,
+                                    &record_id,
+                                    Some(status),
+                                    headers.clone(),
+                                    mime_type,
+                                    Some(body_len),
+                                );
 
                                 let _ = response_tx.send(FetchResponseMsg {
                                     id,
@@ -481,6 +719,7 @@ fn handle_fetch_requests(
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
                             }
                             Err(e) => {
+                                fail_record(&network_log, None);
                                 let _ = response_tx.send(FetchResponseMsg {
                                     id,
                                     status: 0,
@@ -640,9 +879,15 @@ impl Session {
         let cookie_jar_clone = cookie_jar.clone();
         let in_flight = Arc::new(AtomicU64::new(0));
         let in_flight_clone = in_flight.clone();
+        let offline = Arc::new(AtomicBool::new(false));
+        let offline_clone = offline.clone();
         let max_body_bytes = config.max_response_body_bytes;
         let event_tx = std::sync::Arc::new(parking_lot::RwLock::new(None));
         let event_tx_clone = event_tx.clone();
+        let network_log = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+        let network_log_clone = network_log.clone();
+        let overrides = Arc::new(parking_lot::RwLock::new(RequestOverrides::default()));
+        let overrides_clone = overrides.clone();
         let fetch_task = Some(std::thread::spawn(move || {
             handle_fetch_requests(
                 fetch_rx,
@@ -652,6 +897,9 @@ impl Session {
                 max_body_bytes,
                 in_flight_clone,
                 event_tx_clone,
+                offline_clone,
+                network_log_clone,
+                overrides_clone,
             );
         }));
         // Spawn WebSocket bridge handler thread (Phase 4)
@@ -692,6 +940,14 @@ impl Session {
             frame_contexts: parking_lot::RwLock::new(HashMap::new()),
             next_context_id: std::sync::atomic::AtomicU32::new(2),
             in_flight,
+            overrides,
+            next_request_id: AtomicU64::new(0),
+            next_resource_id: AtomicU64::new(0),
+            network_log,
+            offline,
+            init_scripts: Vec::new(),
+            init_script_counter: 0,
+            pending_seed: None,
         })
     }
 
@@ -719,10 +975,22 @@ impl Session {
 
         info!(url = %parsed, "navigating");
 
+        // Offline emulation blocks only real network fetches — `about:` and
+        // `data:` pages are local and stay reachable (matches Chrome DevTools
+        // offline emulation).
+        self.ensure_online()?;
+
+        // Snapshot overrides for this navigation (headers + request log).
+        let ov = self.overrides.read().clone();
+
         // Fetch the document
         let start = std::time::Instant::now();
+        let started_at_ms = unix_ms();
         let _in_flight = InFlightGuard::new(self.in_flight.clone());
-        let response = self.http_client.fetch(&parsed).await?;
+        let response = self
+            .http_client
+            .fetch_with_overrides(&parsed, Some(&ov))
+            .await?;
         let status = response.status().as_u16();
         let final_url = Url::parse(&response.uri().to_string()).unwrap_or_else(|_| parsed.clone());
 
@@ -745,6 +1013,7 @@ impl Session {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let response_headers = HttpClient::response_headers(&response);
         let max = self.config.max_response_body_bytes;
         let (bytes, truncated) = HttpClient::read_body_limited(response, max).await?;
         if truncated {
@@ -769,9 +1038,28 @@ impl Session {
 
         tracing::debug!(status, final_url = %final_url, elapsed_ms = start.elapsed().as_millis() as u64, "page fetched");
 
-        // Store the response body for Network.getResponseBody
+        // Record the document fetch + store the body for
+        // Network.getResponseBody under the same session-monotonic
+        // `req-{n}` id (single requestId namespace for document fetches).
+        let request_id = self.next_doc_request_id();
+        {
+            let mut record = self.begin_record(
+                &request_id,
+                final_url.as_str(),
+                "GET",
+                "Document",
+                &ov,
+                None,
+            );
+            record.started_at_ms = started_at_ms;
+            record.status = Some(status);
+            record.response_headers = response_headers;
+            record.mime_type = HttpClient::mime_without_params(&ct_header);
+            record.response_body_length = Some(bytes.len() as u64);
+            record.finished_at_ms = Some(unix_ms());
+            self.push_record(record);
+        }
         if !html.is_empty() {
-            let request_id = format!("REQ-{}", uuid::Uuid::new_v4().as_simple());
             self.store_response_body(&request_id, html.clone(), &ct_header);
             tracing::trace!(request_id, body_len = html.len(), "response body stored");
         }
@@ -821,14 +1109,37 @@ impl Session {
     }
 
     /// Save a downloaded attachment to the configured download directory and
-    /// emit a [`CoreEvent::Download`]. Returns `Err` if no download directory
-    /// is configured (so the caller falls back to rendering the body).
+    /// emit a [`CoreEvent::Download`].
+    ///
+    /// Directory resolution: the CDP `Page.setDownloadBehavior` override
+    /// ([`set_download_behavior`]) wins; otherwise the session config's
+    /// [`BrowserConfig::download_dir`] (or its platform-temp default via
+    /// [`BrowserConfig::download_dir_or_default`]). The directory is created
+    /// at save time. On save failure a [`CoreEvent::DownloadFailed`] is
+    /// emitted and `Err` is returned so the caller falls back to rendering
+    /// the body.
     fn handle_download(&self, url: &Url, disposition: &str, bytes: &[u8]) -> Result<()> {
         let dir = DOWNLOAD_DIR
             .read()
             .clone()
-            .ok_or_else(|| CoreError::NetworkError("no download directory configured".into()))?;
-        std::fs::create_dir_all(&dir).map_err(|e| CoreError::NetworkError(e.to_string()))?;
+            .unwrap_or_else(|| self.config.download_dir_or_default());
+        // The GUID is allocated up front so the failure event can reference
+        // the same download id the CDP layer would have seen on success.
+        let guid = format!("dl-{}", uuid::Uuid::new_v4().as_simple());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let error = e.to_string();
+            tracing::warn!(dir = %dir.display(), error = %error, "download directory creation failed");
+            if let Some(tx) = self.event_tx.read().as_ref() {
+                let _ = tx.send(crate::js::CoreEvent::DownloadFailed {
+                    guid,
+                    url: url.to_string(),
+                    error,
+                });
+            }
+            return Err(CoreError::NetworkError(format!(
+                "failed to create download directory: {e}"
+            )));
+        }
 
         let filename = filename_from_disposition(disposition)
             .or_else(|| {
@@ -845,10 +1156,21 @@ impl Session {
             .unwrap_or_else(|| "download.bin".to_string());
         let save_path = dir.join(&safe);
 
-        std::fs::write(&save_path, bytes)
-            .map_err(|e| CoreError::NetworkError(format!("failed to write download: {e}")))?;
+        if let Err(e) = std::fs::write(&save_path, bytes) {
+            let error = e.to_string();
+            tracing::warn!(url = %url, save_path = %save_path.display(), error = %error, "download save failed");
+            if let Some(tx) = self.event_tx.read().as_ref() {
+                let _ = tx.send(crate::js::CoreEvent::DownloadFailed {
+                    guid,
+                    url: url.to_string(),
+                    error,
+                });
+            }
+            return Err(CoreError::NetworkError(format!(
+                "failed to write download: {e}"
+            )));
+        }
 
-        let guid = format!("dl-{}", uuid::Uuid::new_v4().as_simple());
         if let Some(tx) = self.event_tx.read().as_ref() {
             let _ = tx.send(crate::js::CoreEvent::Download {
                 guid: guid.clone(),
@@ -933,7 +1255,11 @@ impl Session {
                     continue;
                 }
                 // 2b. http(s) → fetch + parse (original behavior).
-                match self.http_client.fetch_text(&full).await {
+                match self
+                    .http_client
+                    .fetch_text_with_overrides(&full, Some(&self.snapshot_overrides()))
+                    .await
+                {
                     Ok(child_html) => match Frame::from_html(full.clone(), &child_html).await {
                         Ok(child) => new_frames.push(child),
                         Err(e) => tracing::warn!(
@@ -1048,12 +1374,21 @@ impl Session {
             return Err(CoreError::SessionClosed);
         }
         if self.history_index > 0 {
+            self.ensure_online()?;
             self.history_index -= 1;
             let url = self.history[self.history_index].clone();
 
+            let ov = self.overrides.read().clone();
+            let started_at_ms = unix_ms();
+
             // Re-fetch without adding to history
             let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            let response = self.http_client.fetch(&url).await?;
+            let response = self
+                .http_client
+                .fetch_with_overrides(&url, Some(&ov))
+                .await?;
+            let status = response.status().as_u16();
+            let response_headers = HttpClient::response_headers(&response);
             let ct_header = response
                 .headers()
                 .get("content-type")
@@ -1066,6 +1401,15 @@ impl Session {
                 tracing::warn!(url = %url, max_bytes = max, "history body truncated");
             }
             let html = crate::encoding::decode_html(&bytes, Some(&ct_header));
+            self.record_document_fetch(
+                &url,
+                status,
+                &ct_header,
+                response_headers,
+                bytes.len(),
+                &ov,
+                started_at_ms,
+            );
             self.active_page = Some(Page::from_html(url, &html, 200, ct_header).await?);
             self.inject_dom_snapshot().await;
             Ok(())
@@ -1080,11 +1424,20 @@ impl Session {
             return Err(CoreError::SessionClosed);
         }
         if self.history_index < self.history.len() - 1 {
+            self.ensure_online()?;
             self.history_index += 1;
             let url = self.history[self.history_index].clone();
 
+            let ov = self.overrides.read().clone();
+            let started_at_ms = unix_ms();
+
             let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            let response = self.http_client.fetch(&url).await?;
+            let response = self
+                .http_client
+                .fetch_with_overrides(&url, Some(&ov))
+                .await?;
+            let status = response.status().as_u16();
+            let response_headers = HttpClient::response_headers(&response);
             let ct_header = response
                 .headers()
                 .get("content-type")
@@ -1097,6 +1450,15 @@ impl Session {
                 tracing::warn!(url = %url, max_bytes = max, "history body truncated");
             }
             let html = crate::encoding::decode_html(&bytes, Some(&ct_header));
+            self.record_document_fetch(
+                &url,
+                status,
+                &ct_header,
+                response_headers,
+                bytes.len(),
+                &ov,
+                started_at_ms,
+            );
             self.active_page = Some(Page::from_html(url, &html, 200, ct_header).await?);
             self.inject_dom_snapshot().await;
             Ok(())
@@ -1111,8 +1473,18 @@ impl Session {
             return Err(CoreError::SessionClosed);
         }
         if let Some(url) = self.current_url() {
+            self.ensure_online()?;
+
+            let ov = self.overrides.read().clone();
+            let started_at_ms = unix_ms();
+
             let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            let response = self.http_client.fetch(url).await?;
+            let response = self
+                .http_client
+                .fetch_with_overrides(url, Some(&ov))
+                .await?;
+            let status = response.status().as_u16();
+            let response_headers = HttpClient::response_headers(&response);
             let ct_header = response
                 .headers()
                 .get("content-type")
@@ -1125,6 +1497,15 @@ impl Session {
                 tracing::warn!(url = %url, max_bytes = max, "reload body truncated");
             }
             let html = crate::encoding::decode_html(&bytes, Some(&ct_header));
+            self.record_document_fetch(
+                url,
+                status,
+                &ct_header,
+                response_headers,
+                bytes.len(),
+                &ov,
+                started_at_ms,
+            );
             self.active_page = Some(Page::from_html(url.clone(), &html, 200, ct_header).await?);
             self.inject_dom_snapshot().await;
             Ok(())
@@ -1148,12 +1529,18 @@ impl Session {
 
         info!(url = %parsed, content_type, "POST request");
 
+        self.ensure_online()?;
+
         let _in_flight = InFlightGuard::new(self.in_flight.clone());
+        let ov = self.overrides.read().clone();
+        let started_at_ms = unix_ms();
         let response = match content_type {
             "application/json" => {
                 let json_value = serde_json::from_str::<serde_json::Value>(body)
                     .unwrap_or(serde_json::Value::Null);
-                self.http_client.post_json(&parsed, &json_value).await?
+                self.http_client
+                    .post_json_with_overrides(&parsed, &json_value, Some(&ov))
+                    .await?
             }
             "application/x-www-form-urlencoded" => {
                 let form: Vec<(&str, &str)> = body
@@ -1163,12 +1550,19 @@ impl Session {
                         Some((parts.next()?, parts.next().unwrap_or("")))
                     })
                     .collect();
-                self.http_client.post_form(&parsed, &form).await?
+                self.http_client
+                    .post_form_with_overrides(&parsed, &form, Some(&ov))
+                    .await?
             }
-            _ => self.http_client.post(&parsed, body.to_string()).await?,
+            _ => {
+                self.http_client
+                    .post_with_overrides(&parsed, body.to_string(), Some(&ov))
+                    .await?
+            }
         };
 
         let status = response.status().as_u16();
+        let response_headers = HttpClient::response_headers(&response);
         let ct = response
             .headers()
             .get("content-type")
@@ -1184,6 +1578,32 @@ impl Session {
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
 
         let html = crate::encoding::decode_html(&bytes, Some(&ct));
+
+        // Record the POST navigation in the request log (`req-{n}`).
+        {
+            let request_id = self.next_doc_request_id();
+            let (post_body, post_body_truncated) = cap_post_body(Some(body.as_bytes().to_vec()));
+            let mut record = self.begin_record(
+                &request_id,
+                final_url.as_str(),
+                "POST",
+                "Document",
+                &ov,
+                None,
+            );
+            record
+                .request_headers
+                .push(("Content-Type".to_string(), content_type.to_string()));
+            record.started_at_ms = started_at_ms;
+            record.post_body = post_body;
+            record.post_body_truncated = post_body_truncated;
+            record.status = Some(status);
+            record.response_headers = response_headers;
+            record.mime_type = HttpClient::mime_without_params(&ct);
+            record.response_body_length = Some(bytes.len() as u64);
+            record.finished_at_ms = Some(unix_ms());
+            self.push_record(record);
+        }
 
         // Create a new page for this navigation (use final URL after redirects)
         let page = Page::from_html(final_url.clone(), &html, status, ct).await?;
@@ -1305,12 +1725,39 @@ impl Session {
     /// the JS thread. This is a consistent snapshot between JS ticks, with no
     /// serialize/reparse round-trip (the legacy `DomSnapshot` bridge is gone).
     /// The document is laid out at the session's configured viewport.
+    ///
+    /// Guarded: refuses to capture while a password input has focus, so a
+    /// plaintext password can never land in a PNG. The guard error must
+    /// propagate — CDP callers must not fall back to a blank PNG.
     pub async fn capture_screenshot_png(&mut self, _viewport_width: u32) -> Result<Vec<u8>> {
+        if self.password_field_focused().await? {
+            crate::security::audit::record(crate::security::audit::event(
+                crate::security::audit::AuditEventKind::PolicyViolation,
+                crate::security::audit::AuditDecision::Deny,
+                "capture_blocked_password_focus",
+            ));
+            return Err(crate::error::CoreError::JsError(
+                CAPTURE_BLOCKED_MSG.to_string(),
+            ));
+        }
         let opts = oxibrowser_render::CaptureOpts {
             viewport: None,
             full_page: true,
         };
         self.js_runtime.capture_png(opts).await
+    }
+
+    /// Evaluate the active-element probe. Returns `false` (capture allowed)
+    /// if the probe itself fails — the probe is trivial JS and a page-level
+    /// failure must not brick screenshots.
+    async fn password_field_focused(&mut self) -> Result<bool> {
+        let result = self
+            .evaluate_js(&crate::js::form::js_active_password_probe())
+            .await?;
+        match result.value {
+            Some(serde_json::Value::Bool(b)) => Ok(b),
+            _ => Ok(false),
+        }
     }
 
     /// Inject the current page into the JS runtime.
@@ -1354,7 +1801,11 @@ impl Session {
                     continue;
                 };
                 let _in_flight = InFlightGuard::new(self.in_flight.clone());
-                match self.http_client.fetch_text(&full_url).await {
+                match self
+                    .http_client
+                    .fetch_text_with_overrides(&full_url, Some(&self.snapshot_overrides()))
+                    .await
+                {
                     Ok(body) => s.source = body,
                     Err(e) => {
                         tracing::warn!(src = %src, error = %e, "failed to fetch external script")
@@ -1363,11 +1814,40 @@ impl Session {
             }
         }
 
+        // Init scripts (Playwright `addInitScript`): classic inline sources
+        // (`ScriptKind` has no dedicated inline variant — `Classic` is the
+        // inline form) prepended so they execute before every page script in
+        // the shared `run_navigation_scripts` loop. A failing init script is
+        // recorded through the loop's existing error sink
+        // (`CoreEvent::Exception` + warn log) and execution continues; a
+        // runaway script is bounded by the nav-script limits like any page
+        // script.
+        if !self.init_scripts.is_empty() {
+            let init: Vec<ScriptSource> = self
+                .init_scripts
+                .iter()
+                .map(|(id, source)| {
+                    tracing::trace!(script = %id, bytes = source.len(), "queueing init script");
+                    ScriptSource {
+                        source: source.clone(),
+                        src_url: None,
+                        kind: ScriptKind::Classic,
+                        execute: ExecuteTiming::Defer,
+                    }
+                })
+                .collect();
+            let page_scripts = std::mem::replace(&mut scripts, init);
+            scripts.extend(page_scripts);
+        }
+
         // Set window.location BEFORE running page scripts: `set_page_url`
         // re-registers the whole `window` global, so it must precede script
         // execution — otherwise any `window.*` properties a script sets
         // (window.onload handlers, framework globals, etc.) would be wiped.
-        self.js_runtime.set_page_url(&url);
+        // Consumes the storageState seed stashed by `import_state`, so the
+        // JS-side localStorage is seeded before init/page scripts run.
+        let seed = self.pending_seed.take();
+        self.js_runtime.set_page_url_with_storage_seed(&url, seed);
         // Build/replace the render document AND execute the page's `<script>`
         // tags (Phase 1 keystone).
         let viewport = current_viewport_override()
@@ -1385,7 +1865,11 @@ impl Session {
                 if full.scheme() != "http" && full.scheme() != "https" {
                     continue;
                 }
-                match self.http_client.fetch_bytes(&full).await {
+                match self
+                    .http_client
+                    .fetch_bytes_with_overrides(&full, Some(&self.snapshot_overrides()))
+                    .await
+                {
                     Ok(bytes) => fonts.push(bytes),
                     Err(e) => tracing::warn!(url = %full, error = %e, "@font-face fetch failed"),
                 }
@@ -1446,7 +1930,11 @@ impl Session {
             self.in_flight.fetch_add(1, Ordering::Relaxed);
             let _g = InFlightGuard::new(self.in_flight.clone());
             tracing::debug!(%full, "fetching external stylesheet");
-            match self.http_client.fetch_text(&full).await {
+            match self
+                .http_client
+                .fetch_text_with_overrides(&full, Some(&self.snapshot_overrides()))
+                .await
+            {
                 Ok(css) => {
                     tracing::debug!(bytes = css.len(), %full, "fetched external stylesheet");
                     if !combined_css.is_empty() {
@@ -1517,7 +2005,11 @@ impl Session {
                         continue;
                     };
                     let _in_flight = InFlightGuard::new(self.in_flight.clone());
-                    match self.http_client.fetch_text(&full_url).await {
+                    match self
+                        .http_client
+                        .fetch_text_with_overrides(&full_url, Some(&self.snapshot_overrides()))
+                        .await
+                    {
                         Ok(body) => s.source = body,
                         Err(e) => {
                             tracing::warn!(src = %src, error = %e, "failed to fetch child frame script")
@@ -1658,6 +2150,74 @@ impl Session {
         self.http_client.clone()
     }
 
+    /// Replace the per-session request overrides (CDP
+    /// `Emulation.setUserAgentOverride` / `Network.setExtraHTTPHeaders`).
+    pub fn set_overrides(&mut self, ov: RequestOverrides) {
+        *self.overrides.write() = ov;
+    }
+
+    /// Read the current request overrides (a snapshot — the stored value is
+    /// shared with the background fetch bridge thread).
+    pub fn overrides(&self) -> RequestOverrides {
+        self.snapshot_overrides()
+    }
+
+    /// Snapshot (clone) the current request overrides. Session code clones
+    /// instead of holding the lock across `await`.
+    fn snapshot_overrides(&self) -> RequestOverrides {
+        self.overrides.read().clone()
+    }
+
+    /// UA actually in effect: the override if set, else the configured UA.
+    /// This is what document/sub-resource requests carry on the wire.
+    pub fn effective_ua(&self) -> String {
+        self.overrides
+            .read()
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| self.config.user_agent.clone())
+    }
+
+    /// Toggle offline emulation (CDP `Network.emulateNetworkConditions`).
+    ///
+    /// While offline, every network fetch the Session would issue — document
+    /// navigations, history traversals, sub-resources, POSTs, and JS-issued
+    /// fetches — fails immediately with an "offline" error instead of
+    /// performing I/O.
+    pub fn set_offline(&self, on: bool) {
+        self.offline.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether offline emulation is active.
+    pub fn is_offline(&self) -> bool {
+        self.offline.load(Ordering::SeqCst)
+    }
+
+    /// Return an "offline" error when offline emulation is active.
+    fn ensure_online(&self) -> Result<()> {
+        if self.is_offline() {
+            return Err(CoreError::NetworkError("offline".into()));
+        }
+        Ok(())
+    }
+
+    /// Push a JS-surface user-agent override (`navigator.userAgent` + the
+    /// stealth fingerprint profile). `None` clears it. Used by the CDP
+    /// `Emulation.setUserAgentOverride` handler so the JS surface and the
+    /// wire UA agree.
+    pub fn set_js_user_agent(&self, ua: Option<String>) {
+        self.js_runtime.set_user_agent(ua);
+    }
+
+    /// Override the CSS `prefers-color-scheme` media feature: `Some(true)`
+    /// = dark, `Some(false)` = light, `None` = clear (default light).
+    /// `matchMedia` probes see the change immediately; layout picks it up at
+    /// the next document generation. Used by the CDP
+    /// `Emulation.setEmulatedMedia` handler.
+    pub fn set_media_color_scheme(&self, dark: Option<bool>) {
+        self.js_runtime.set_media_color_scheme(dark);
+    }
+
     /// Snapshot of currently in-flight HTTP requests (navigates + JS fetches).
     ///
     /// Returns the count of dispatched requests whose response (or terminal
@@ -1686,6 +2246,112 @@ impl Session {
         self.local_storage.write().insert(key.into(), value.into());
     }
 
+    /// Register an init script (Playwright `Page.addInitScript`).
+    ///
+    /// The `source` is evaluated in the page context before the page's own
+    /// `<script>` tags on **every** subsequent document injection
+    /// (navigate / go_back / go_forward / reload / about:/data: pages), after
+    /// window globals are (re-)registered. Returns a stable script id
+    /// (`"init-N"`, monotonic per session) usable with
+    /// [`Session::remove_init_script`].
+    pub fn add_init_script(&mut self, source: String) -> String {
+        self.init_script_counter += 1;
+        let id = format!("init-{}", self.init_script_counter);
+        tracing::debug!(script = %id, bytes = source.len(), "init script registered");
+        self.init_scripts.push((id.clone(), source));
+        id
+    }
+
+    /// Remove a previously registered init script by id. Returns `true` when
+    /// a script with that id existed and was removed.
+    pub fn remove_init_script(&mut self, id: &str) -> bool {
+        let before = self.init_scripts.len();
+        self.init_scripts.retain(|(script_id, _)| script_id != id);
+        let removed = self.init_scripts.len() < before;
+        if removed {
+            tracing::debug!(script = %id, "init script removed");
+        }
+        removed
+    }
+
+    /// Export the session's storage state (Playwright `storageState`).
+    ///
+    /// Cookies come from the session's [`CookieJar`]; localStorage is the
+    /// session's single storage map exported under **one** origin derived
+    /// from the current page URL. Limitation: the session keeps one flat
+    /// storage map, not per-origin partitions — entries stored while visiting
+    /// other origins are folded into the current origin's bucket (mirrored by
+    /// the TODO(#sop) cross-origin note on the `SetPageUrl` handler).
+    /// With no active page (or an opaque origin, e.g. `about:blank` / `data:`
+    /// URLs), `origins` is empty.
+    pub fn export_state(&self) -> crate::storage_state::StorageState {
+        let cookies = self.cookie_jar.read().get_all();
+        let origins = match self.current_url() {
+            Some(url) => match url.origin() {
+                url::Origin::Tuple(..) => {
+                    let map = self.local_storage.read();
+                    if map.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![crate::storage_state::OriginState {
+                            origin: url.origin().ascii_serialization(),
+                            local_storage: map
+                                .iter()
+                                .map(|(k, v)| crate::storage_state::LocalStorageEntry {
+                                    name: k.clone(),
+                                    value: v.clone(),
+                                })
+                                .collect(),
+                        }]
+                    }
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        crate::storage_state::StorageState { cookies, origins }
+    }
+
+    /// Import a storage state (Playwright `storageState` merge): cookies are
+    /// merged into the session's [`CookieJar`] (same-name/path cookies per
+    /// domain are replaced), localStorage entries are injected into the
+    /// session storage map and stashed as a seed that the **next** document
+    /// injection hands to the JS thread (`SetPageUrl`), so `getItem` sees the
+    /// imported values after the following navigation. Limitation: as with
+    /// export, only the single flat session map exists — all origins' entries
+    /// merge into it (later origins overwrite earlier keys).
+    pub fn import_state(&mut self, st: &crate::storage_state::StorageState) -> Result<()> {
+        {
+            let mut jar = self.cookie_jar.write();
+            for cookie in &st.cookies {
+                jar.insert_entry(cookie.clone());
+            }
+        }
+        tracing::debug!(cookies = st.cookies.len(), "storageState cookies merged");
+        if st.origins.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut ls = self.local_storage.write();
+            for origin in &st.origins {
+                for kv in &origin.local_storage {
+                    ls.insert(kv.name.clone(), kv.value.clone());
+                }
+            }
+        }
+        // Stash the full (post-injection) map: the JS-side storage starts
+        // empty on first registration, so the seed must carry everything the
+        // session map holds. Consumed on the next SetPageUrl.
+        let seed = self.local_storage.read().clone();
+        tracing::debug!(
+            origins = st.origins.len(),
+            keys = seed.len(),
+            "storageState localStorage seeded for next navigation"
+        );
+        self.pending_seed = Some(seed);
+        Ok(())
+    }
+
     /// Get a local storage value.
     pub fn get_local_storage(&self, key: &str) -> Option<String> {
         self.local_storage.read().get(key).cloned()
@@ -1707,6 +2373,147 @@ impl Session {
     /// Get a stored response body by request ID.
     pub fn get_response_body(&self, request_id: &str) -> Option<CapturedResponse> {
         self.response_bodies.read().get(request_id).cloned()
+    }
+
+    /// Mint the next session-monotonic document/page request id (`req-{n}`).
+    /// Shared by the response-body store, the request log, and (via the CDP
+    /// layer) `Network.requestWillBeSent` correlation.
+    fn next_doc_request_id(&self) -> String {
+        format!(
+            "req-{}",
+            self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1
+        )
+    }
+
+    /// Mint the next session-monotonic sub-resource request id (`res-{n}`).
+    fn next_sub_request_id(&self) -> String {
+        format!(
+            "res-{}",
+            self.next_resource_id.fetch_add(1, Ordering::Relaxed) + 1
+        )
+    }
+
+    /// Start a [`RequestRecord`] for a Session-issued request. The returned
+    /// record is incomplete (`status: None`) until the caller fills the
+    /// response fields and passes it to [`Session::push_record`].
+    fn begin_record(
+        &self,
+        request_id: &str,
+        url: &str,
+        method: &str,
+        resource_type: &str,
+        ov: &RequestOverrides,
+        post_body: Option<Vec<u8>>,
+    ) -> RequestRecord {
+        let (post_body, post_body_truncated) = cap_post_body(post_body);
+        let mut request_headers = Vec::with_capacity(ov.extra_headers.len() + 1);
+        request_headers.push(("User-Agent".to_string(), self.effective_ua()));
+        for (name, value) in &ov.extra_headers {
+            if name.eq_ignore_ascii_case("user-agent") {
+                continue; // already represented by the effective UA
+            }
+            request_headers.push((name.clone(), value.clone()));
+        }
+        RequestRecord {
+            request_id: request_id.to_string(),
+            url: url.to_string(),
+            method: method.to_string(),
+            resource_type: resource_type.to_string(),
+            request_headers,
+            post_body,
+            post_body_truncated,
+            status: None,
+            response_headers: Vec::new(),
+            mime_type: String::new(),
+            started_at_ms: unix_ms(),
+            finished_at_ms: None,
+            // No response cache exists — nothing can come from cache.
+            from_cache: false,
+            response_body_length: None,
+        }
+    }
+
+    /// Append a completed/in-progress record to the rolling request log,
+    /// evicting the oldest entry past [`NETWORK_LOG_CAP`].
+    fn push_record(&self, record: RequestRecord) {
+        record_request_start(&self.network_log, record);
+    }
+
+    /// Complete the newest record with the given id: response status,
+    /// headers, MIME type and body length.
+    fn record_request_finish_by_id(
+        &self,
+        request_id: &str,
+        status: Option<u16>,
+        response_headers: Vec<(String, String)>,
+        mime_type: String,
+        response_body_length: Option<u64>,
+    ) {
+        record_request_finish(
+            &self.network_log,
+            request_id,
+            status,
+            response_headers,
+            mime_type,
+            response_body_length,
+        );
+    }
+
+    /// Record a history-navigation / reload document fetch (fresh `req-{n}`
+    /// id; these paths don't store response bodies, so the id only feeds the
+    /// request log).
+    #[allow(clippy::too_many_arguments)] // channel/protocol boundary: one arg per field
+    fn record_document_fetch(
+        &self,
+        url: &Url,
+        status: u16,
+        ct_header: &str,
+        response_headers: Vec<(String, String)>,
+        body_len: usize,
+        ov: &RequestOverrides,
+        started_at_ms: f64,
+    ) {
+        let request_id = self.next_doc_request_id();
+        let mut record = self.begin_record(&request_id, url.as_str(), "GET", "Document", ov, None);
+        record.started_at_ms = started_at_ms;
+        record.status = Some(status);
+        record.response_headers = response_headers;
+        record.mime_type = HttpClient::mime_without_params(ct_header);
+        record.response_body_length = Some(body_len as u64);
+        record.finished_at_ms = Some(unix_ms());
+        self.push_record(record);
+    }
+
+    /// Emit a [`crate::js::CoreEvent`] to the attached sink, if any. No-op
+    /// when no observer is installed (e.g. the CLI path).
+    fn emit_core_event(&self, event: crate::js::CoreEvent) {
+        if let Some(sender) = self.event_tx.read().as_ref() {
+            let _ = sender.send(event);
+        }
+    }
+
+    /// Snapshot of the rolling request log (oldest first). Covers document
+    /// navigations (`navigate`/`reload`/`go_back`/`go_forward`/`post`),
+    /// sub-resource fetches, and JS-issued `fetch`/XHR.
+    pub fn network_log_snapshot(&self) -> Vec<RequestRecord> {
+        self.network_log.lock().iter().cloned().collect()
+    }
+
+    /// Clear the rolling request log.
+    pub fn clear_network_log(&self) {
+        self.network_log.lock().clear();
+    }
+
+    /// HAR 1.2 JSON export of the current request log
+    /// ([`crate::network::har::to_har_json`]).
+    pub fn network_log_har(&self) -> serde_json::Value {
+        har::to_har_json(&self.network_log_snapshot())
+    }
+
+    /// Raw (unredacted) HAR view — `--har-raw` only. Carries cookies, bearer
+    /// tokens, and POST bodies verbatim; the CLI audit-logs this call.
+    pub fn network_log_har_raw(&self) -> serde_json::Value {
+        har::to_har_json_raw(&self.network_log_snapshot())
     }
 
     /// Get the cookie jar for this session.
@@ -1750,10 +2557,18 @@ impl Session {
     /// Fetch sub-resources (JS, CSS, images) referenced by the current page.
     ///
     /// Extracts resource URLs from the DOM, fetches them over HTTP,
-    /// and attaches them as `Resource` objects to the page.
+    /// and attaches them as `Resource` objects to the page (with the real
+    /// HTTP status / MIME type from the response). Each fetch is recorded in
+    /// the session request log under a session-monotonic `res-{n}` id and,
+    /// when an event sink is attached, emits
+    /// [`crate::js::CoreEvent::SubresourceFetchRequest`] /
+    /// [`SubresourceFetchResponse`](crate::js::CoreEvent::SubresourceFetchResponse)
+    /// / [`SubresourceFetchFailed`](crate::js::CoreEvent::SubresourceFetchFailed).
     ///
     /// Returns the number of resources successfully loaded.
     pub async fn load_sub_resources(&mut self) -> usize {
+        use crate::js::dom_snapshot::ResourceKind;
+
         let resource_urls = match self.active_page.as_ref() {
             Some(page) => page.root_frame().extract_resource_urls(),
             None => return 0,
@@ -1763,10 +2578,23 @@ impl Session {
             return 0;
         }
 
+        // Offline emulation: skip all sub-resource I/O. The document path
+        // surfaces the same condition as an "offline" error; this path has no
+        // error channel, so it reports zero loaded resources instead.
+        if self.is_offline() {
+            tracing::warn!(
+                count = resource_urls.len(),
+                "offline: skipping sub-resource fetches"
+            );
+            return 0;
+        }
+
         let base_url = match self.current_url() {
             Some(u) => u.clone(),
             None => return 0,
         };
+
+        let ov = self.snapshot_overrides();
 
         let mut loaded = 0;
         for res in &resource_urls {
@@ -1776,38 +2604,97 @@ impl Session {
                 Err(_) => continue,
             };
 
-            let resource_type = match res.kind {
-                crate::js::dom_snapshot::ResourceKind::Script => {
-                    crate::network::resource::ResourceType::Script
-                }
-                crate::js::dom_snapshot::ResourceKind::Stylesheet => {
-                    crate::network::resource::ResourceType::Stylesheet
-                }
-                crate::js::dom_snapshot::ResourceKind::Image => {
-                    crate::network::resource::ResourceType::Image
-                }
-                crate::js::dom_snapshot::ResourceKind::Iframe => {
-                    crate::network::resource::ResourceType::Document
+            let (resource_type, cdp_type) = match res.kind {
+                ResourceKind::Script => (crate::network::resource::ResourceType::Script, "Script"),
+                ResourceKind::Stylesheet => (
+                    crate::network::resource::ResourceType::Stylesheet,
+                    "Stylesheet",
+                ),
+                ResourceKind::Image => (crate::network::resource::ResourceType::Image, "Image"),
+                ResourceKind::Iframe => {
+                    (crate::network::resource::ResourceType::Document, "Document")
                 }
             };
 
+            let request_id = self.next_sub_request_id();
+            let started_at_ms = unix_ms();
+
+            self.emit_core_event(crate::js::CoreEvent::SubresourceFetchRequest {
+                request_id: request_id.clone(),
+                url: full_url.to_string(),
+                method: "GET".to_string(),
+                resource_type: cdp_type.to_string(),
+                timestamp: started_at_ms,
+            });
+
+            let mut record =
+                self.begin_record(&request_id, full_url.as_str(), "GET", cdp_type, &ov, None);
+            record.started_at_ms = started_at_ms;
+            self.push_record(record);
+
             let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            match self.http_client.fetch_text(&full_url).await {
-                Ok(body) => {
+            match self
+                .http_client
+                .fetch_response_with_overrides(&full_url, Some(&ov))
+                .await
+            {
+                Ok(fetched) => {
+                    // Text resources decode as UTF-8 (lossy) so downstream
+                    // consumers keep seeing `String` bodies; images/iframes
+                    // keep raw bytes.
+                    let body = match res.kind {
+                        ResourceKind::Script | ResourceKind::Stylesheet => {
+                            bytes::Bytes::from(String::from_utf8_lossy(&fetched.body).into_owned())
+                        }
+                        ResourceKind::Image | ResourceKind::Iframe => {
+                            bytes::Bytes::from(fetched.body)
+                        }
+                    };
+                    let length = body.len() as u64;
+
                     let resource = crate::network::resource::Resource {
                         url: full_url.to_string(),
                         resource_type,
-                        status: 200,
-                        mime_type: String::new(),
-                        body: bytes::Bytes::from(body),
+                        status: fetched.status,
+                        mime_type: fetched.mime_type.clone(),
+                        body,
                         loaded_at: std::time::Instant::now(),
                     };
                     if let Some(page) = self.active_page.as_mut() {
                         page.add_resource(resource);
                     }
                     loaded += 1;
+
+                    self.record_request_finish_by_id(
+                        &request_id,
+                        Some(fetched.status),
+                        fetched.headers.clone(),
+                        fetched.mime_type.clone(),
+                        Some(length),
+                    );
+                    self.emit_core_event(crate::js::CoreEvent::SubresourceFetchResponse {
+                        request_id: request_id.clone(),
+                        url: full_url.to_string(),
+                        status: fetched.status,
+                        mime_type: fetched.mime_type,
+                        length,
+                        timestamp: unix_ms(),
+                    });
                 }
                 Err(e) => {
+                    self.record_request_finish_by_id(
+                        &request_id,
+                        None,
+                        Vec::new(),
+                        String::new(),
+                        None,
+                    );
+                    self.emit_core_event(crate::js::CoreEvent::SubresourceFetchFailed {
+                        request_id: request_id.clone(),
+                        url: full_url.to_string(),
+                        error_text: e.to_string(),
+                        timestamp: unix_ms(),
+                    });
                     tracing::warn!(
                         url = %full_url,
                         error = %e,
@@ -1868,6 +2755,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_ua_prefers_override_then_config() {
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        let configured = config.user_agent.clone();
+        let cookie_jar = Arc::new(RwLock::new(CookieJar::new()));
+        let http_client = Arc::new(HttpClient::new(&config, cookie_jar.clone()).unwrap());
+        let mut session = Session::new(BrowserId::next(), config, http_client, cookie_jar)
+            .await
+            .unwrap();
+
+        // No override → configured UA.
+        session.set_overrides(RequestOverrides::default());
+        assert_eq!(session.effective_ua(), configured);
+
+        // Override set → override wins; extra headers round-trip.
+        session.set_overrides(RequestOverrides {
+            user_agent: Some("OverrideUA/9.9".into()),
+            extra_headers: vec![("X-Test".to_string(), "1".to_string())],
+        });
+        assert_eq!(session.effective_ua(), "OverrideUA/9.9");
+        assert_eq!(
+            session.overrides().extra_headers,
+            vec![("X-Test".to_string(), "1".to_string())]
+        );
+
+        // Clearing the override restores the configured UA.
+        session.set_overrides(RequestOverrides::default());
+        assert_eq!(session.effective_ua(), configured);
+    }
+
+    #[tokio::test]
+    async fn offline_mode_rejects_navigate_and_allows_local_pages() {
+        let mut session = make_session().await;
+        assert!(!session.is_offline());
+
+        session.set_offline(true);
+        assert!(session.is_offline());
+
+        // Network navigation fails fast with the offline error — before any
+        // DNS/connection attempt (the URL is not even resolved).
+        let err = session
+            .navigate("https://offline.invalid/example")
+            .await
+            .unwrap_err();
+        match err {
+            CoreError::NetworkError(msg) => assert_eq!(msg, "offline"),
+            other => panic!("expected NetworkError(\"offline\"), got {other:?}"),
+        }
+
+        // Local pages stay reachable while offline (no network fetch).
+        assert!(session.navigate("about:blank").await.is_ok());
+        assert!(session.navigate("data:text/html,<b>hi</b>").await.is_ok());
+
+        session.set_offline(false);
+        assert!(!session.is_offline());
+    }
+
+    #[tokio::test]
     async fn test_inject_dom_snapshot_runs_inline_scripts() {
         // Phase 1 keystone end-to-end: a page's inline <script> must execute
         // during document injection, mutating the live DOM that a later
@@ -1925,6 +2870,313 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_init_script_runs_before_page_script_on_data_url() {
+        // Acceptance (#1): a registered init script must execute before the
+        // page's own <script> — proven on a data: URL page whose inline
+        // script appends 'P' after the init script's 'I'.
+        let mut session = make_session().await;
+        let id = session
+            .add_init_script("globalThis.__order = (globalThis.__order || '') + 'I';".to_string());
+        assert_eq!(id, "init-1", "init script ids are init-N, monotonic");
+        session
+            .navigate(
+                "data:text/html,<html><body><script>globalThis.__order = \
+                 (globalThis.__order || '') + 'P';</script></body></html>",
+            )
+            .await
+            .expect("navigate data: URL");
+
+        let r = session
+            .evaluate_js("globalThis.__order")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("IP")),
+            "init script must run before the page script"
+        );
+
+        // Init scripts persist across navigations and re-run every time. The
+        // JS context itself persists, so the accumulated string grows.
+        session
+            .navigate("about:blank")
+            .await
+            .expect("navigate about");
+        let r = session
+            .evaluate_js("globalThis.__order")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("IPI")),
+            "init script re-ran on the next page (before its scripts — about:blank has none)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_script_add_remove_monotonic_ids() {
+        let mut session = make_session().await;
+        assert_eq!(session.add_init_script("// a".into()), "init-1");
+        let second = session.add_init_script("// b".into());
+        assert_eq!(second, "init-2", "counter is monotonic per session");
+        assert!(
+            session.remove_init_script("init-1"),
+            "removing an existing id returns true"
+        );
+        assert!(
+            !session.remove_init_script("init-1"),
+            "removing a missing id returns false"
+        );
+        assert!(session.remove_init_script(&second));
+        assert!(!session.remove_init_script(&second));
+    }
+
+    #[tokio::test]
+    async fn test_storage_state_export_import_roundtrip() {
+        use crate::network::cookie::{CookieEntry, SameSite};
+        use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
+        let mut session = make_session().await;
+
+        let st = StorageState {
+            cookies: vec![CookieEntry {
+                name: "sid".into(),
+                value: "abc".into(),
+                path: Some("/".into()),
+                domain: Some("example.com".into()),
+                secure: true,
+                http_only: true,
+                same_site: Some(SameSite::Lax),
+                ..Default::default()
+            }],
+            origins: vec![OriginState {
+                origin: "https://example.com".into(),
+                local_storage: vec![LocalStorageEntry {
+                    name: "k".into(),
+                    value: "v".into(),
+                }],
+            }],
+        };
+        session.import_state(&st).expect("import");
+
+        // Cookies merged into the jar (insert_entry semantics).
+        let all = session.cookie_jar().read().get_all();
+        assert_eq!(all.len(), 1, "cookie merged");
+        assert_eq!(all[0].name, "sid");
+        assert_eq!(all[0].value, "abc");
+        assert_eq!(all[0].domain.as_deref(), Some("example.com"));
+        assert_eq!(all[0].same_site, Some(SameSite::Lax));
+
+        // No active page yet → export has cookies but no origins.
+        let exported = session.export_state();
+        assert_eq!(exported.cookies.len(), 1);
+        assert!(exported.origins.is_empty(), "no active page → no origins");
+
+        // Attach a page on the matching origin: the single storage map is
+        // exported under that one origin.
+        let page = Page::from_html(
+            Url::parse("https://example.com/x").unwrap(),
+            "<html><body></body></html>",
+            200,
+            "text/html".into(),
+        )
+        .await
+        .unwrap();
+        session.inject_dom_snapshot_for_test(page).await;
+
+        let exported = session.export_state();
+        assert_eq!(exported.origins.len(), 1, "single-origin limitation");
+        assert_eq!(exported.origins[0].origin, "https://example.com");
+        assert_eq!(
+            exported.origins[0].local_storage,
+            vec![LocalStorageEntry {
+                name: "k".into(),
+                value: "v".into()
+            }]
+        );
+
+        // Playwright-compatible JSON shape (sameSite casing + localStorage key).
+        let json = serde_json::to_string(&exported).unwrap();
+        assert!(
+            json.contains(r#""sameSite":"Lax""#),
+            "sameSite casing: {json}"
+        );
+        assert!(
+            json.contains(r#""localStorage""#),
+            "localStorage key: {json}"
+        );
+
+        // Full round-trip into a fresh session.
+        let back: StorageState = serde_json::from_str(&json).unwrap();
+        let mut s2 = make_session().await;
+        s2.import_state(&back).expect("re-import");
+        assert_eq!(s2.cookie_jar().read().get_all().len(), 1);
+        assert_eq!(s2.get_local_storage("k").as_deref(), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn test_storage_state_seed_restores_local_storage_after_navigate() {
+        use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
+        let mut session = make_session().await;
+        session
+            .import_state(&StorageState {
+                cookies: vec![],
+                origins: vec![OriginState {
+                    origin: "https://example.com".into(),
+                    local_storage: vec![LocalStorageEntry {
+                        name: "token".into(),
+                        value: "t0k3n".into(),
+                    }],
+                }],
+            })
+            .expect("import");
+
+        // The next navigation consumes the pending seed via SetPageUrl; the
+        // JS-side localStorage starts from the seed map.
+        session.navigate("about:blank").await.expect("navigate");
+        let r = session
+            .evaluate_js("localStorage.getItem('token')")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("t0k3n")),
+            "imported localStorage must be visible after the next navigation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_storage_state_seed_merges_into_existing_local_storage() {
+        use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
+        let mut session = make_session().await;
+        session
+            .navigate("about:blank")
+            .await
+            .expect("first navigate");
+        session
+            .evaluate_js("localStorage.setItem('a', '1'); localStorage.setItem('c', '1');")
+            .await
+            .expect("seed existing storage");
+
+        // Import overwrites 'a', adds 'b', and must preserve 'c'.
+        session
+            .import_state(&StorageState {
+                cookies: vec![],
+                origins: vec![OriginState {
+                    origin: "https://example.com".into(),
+                    local_storage: vec![
+                        LocalStorageEntry {
+                            name: "a".into(),
+                            value: "2".into(),
+                        },
+                        LocalStorageEntry {
+                            name: "b".into(),
+                            value: "3".into(),
+                        },
+                    ],
+                }],
+            })
+            .expect("import");
+        session
+            .navigate("about:blank")
+            .await
+            .expect("second navigate");
+
+        let r = session
+            .evaluate_js(
+                "(function(){ return { a: localStorage.getItem('a'), \
+                 b: localStorage.getItem('b'), c: localStorage.getItem('c') }; })()",
+            )
+            .await
+            .expect("evaluate");
+        let o = r.value.expect("object result");
+        assert_eq!(
+            o["a"],
+            serde_json::json!("2"),
+            "seed key overwrites existing"
+        );
+        assert_eq!(o["b"], serde_json::json!("3"), "seed key is added");
+        assert_eq!(
+            o["c"],
+            serde_json::json!("1"),
+            "existing non-seed key is preserved"
+        );
+    }
+
+    /// `DOWNLOAD_DIR` is a process-wide static — tests that touch it
+    /// (override set/clear or the config-fallback path) hold this guard.
+    static DOWNLOAD_DIR_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[tokio::test]
+    async fn test_download_save_failure_emits_download_failed() {
+        let _guard = DOWNLOAD_DIR_GUARD.lock();
+        let mut session = make_session().await;
+        let (tx, rx) = std::sync::mpsc::channel();
+        session.set_event_sink(tx);
+
+        // A path under /dev/null can never hold a directory → save must fail.
+        set_download_behavior(Some(std::path::PathBuf::from("/dev/null/oxi-dl-fail")));
+        let url = Url::parse("https://example.com/file.bin").unwrap();
+        let result = session.handle_download(&url, "attachment; filename=file.bin", b"data");
+        set_download_behavior(None);
+        drop(_guard);
+
+        let err = result.expect_err("unwritable target must fail the save");
+        assert!(
+            matches!(err, CoreError::NetworkError(_)),
+            "expected NetworkError, got {err:?}"
+        );
+        match rx.try_recv().expect("DownloadFailed event must be emitted") {
+            crate::js::CoreEvent::DownloadFailed { url, error, .. } => {
+                assert!(
+                    url.contains("file.bin"),
+                    "event carries the source URL: {url}"
+                );
+                assert!(!error.is_empty(), "event carries the I/O error");
+            }
+            other => panic!("expected DownloadFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_uses_config_download_dir_when_override_unset() {
+        let _guard = DOWNLOAD_DIR_GUARD.lock();
+        let mut session = make_session().await;
+        // No CDP override: the config field resolves the target directory.
+        let dir = std::env::temp_dir().join(format!("oxi-dl-cfg-{}", uuid::Uuid::new_v4()));
+        session.config.download_dir = Some(dir.clone());
+        set_download_behavior(None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        session.set_event_sink(tx);
+
+        let url = Url::parse("https://example.com/report.pdf").unwrap();
+        session
+            .handle_download(&url, "attachment; filename=report.pdf", b"pdf-bytes")
+            .expect("save with config download_dir");
+
+        let saved = dir.join("report.pdf");
+        assert_eq!(
+            std::fs::read(&saved).expect("file saved to config dir"),
+            b"pdf-bytes",
+            "saved content matches"
+        );
+        match rx.try_recv().expect("Download event must be emitted") {
+            crate::js::CoreEvent::Download {
+                filename,
+                save_path,
+                total_bytes,
+                ..
+            } => {
+                assert_eq!(filename, "report.pdf");
+                assert_eq!(save_path, saved.to_string_lossy());
+                assert_eq!(total_bytes, 9);
+            }
+            other => panic!("expected Download, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&saved);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
     async fn test_navigate_to_attachment_downloads_file() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1940,6 +3192,7 @@ mod tests {
             .await;
 
         let dir = std::env::temp_dir().join(format!("oxi-dl-{}", uuid::Uuid::new_v4()));
+        let _guard = DOWNLOAD_DIR_GUARD.lock();
         set_download_behavior(Some(dir.clone()));
 
         let mut session = make_session().await;
@@ -2181,6 +3434,222 @@ mod tests {
             r3.value,
             Some(serde_json::json!("undefined")),
             "main frame should be isolated from child frame globals"
+        );
+    }
+
+    /// W4a: document + sub-resource fetches land in the session request log
+    /// with real status/MIME, emit `SubresourceFetch*` core events, and
+    /// serialize to a HAR 1.2 document with one entry per request.
+    #[tokio::test]
+    async fn test_network_log_records_documents_and_subresources_with_events() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // NOTE: the <img> uses an ABSOLUTE url on purpose. blitz-html eagerly
+        // resolves relative sub-resource URLs during parsing against its
+        // placeholder `data:` base URL (RenderDocument::from_html sets the
+        // real base URL only after parsing), so a relative <img src> panics
+        // inside Page::from_html — a pre-existing render-layer bug, unrelated
+        // to the network log. Absolute URLs resolve against any base.
+        let img_url = format!("{}/img.png", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    format!(
+                        r#"<html><head></head><body><img src="{img_url}"><p>hi</p></body></html>"#,
+                    )
+                    .into_bytes(),
+                    "text/html; charset=utf-8",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let png_magic: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(png_magic.clone(), "image/png"))
+            .mount(&server)
+            .await;
+
+        let mut session = make_session().await;
+        let (tx, rx) = std::sync::mpsc::channel::<crate::js::CoreEvent>();
+        session.set_event_sink(tx);
+
+        session
+            .navigate(&format!("{}/", server.uri()))
+            .await
+            .expect("navigate");
+        let loaded = session.load_sub_resources().await;
+        assert_eq!(loaded, 1, "one image sub-resource should load");
+
+        // Request log: document + image records with real status/MIME.
+        let log = session.network_log_snapshot();
+        assert_eq!(log.len(), 2, "document + image records, got: {log:?}");
+        let doc = &log[0];
+        assert_eq!(
+            doc.request_id, "req-1",
+            "document ids use the req- namespace"
+        );
+        assert_eq!(doc.method, "GET");
+        assert_eq!(doc.resource_type, "Document");
+        assert_eq!(doc.status, Some(200));
+        assert_eq!(doc.mime_type, "text/html");
+        assert!(doc.finished_at_ms.is_some());
+        assert!(
+            doc.response_body_length.unwrap_or(0) > 0,
+            "document body length should be observed"
+        );
+        assert!(!doc.from_cache, "no cache exists");
+        let img = &log[1];
+        assert_eq!(
+            img.request_id, "res-1",
+            "sub-resource ids use the res- namespace"
+        );
+        assert_eq!(img.resource_type, "Image");
+        assert_eq!(img.status, Some(200));
+        assert_eq!(img.mime_type, "image/png");
+        assert_eq!(img.response_body_length, Some(png_magic.len() as u64));
+
+        // Subresource events reached the event sink.
+        let mut saw_request = false;
+        let mut saw_response = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::js::CoreEvent::SubresourceFetchRequest {
+                    request_id,
+                    url,
+                    method,
+                    resource_type,
+                    ..
+                } => {
+                    saw_request = true;
+                    assert_eq!(request_id, "res-1");
+                    assert_eq!(method, "GET");
+                    assert_eq!(resource_type, "Image");
+                    assert_eq!(url, img_url);
+                }
+                crate::js::CoreEvent::SubresourceFetchResponse {
+                    request_id,
+                    status,
+                    mime_type,
+                    length,
+                    ..
+                } => {
+                    saw_response = true;
+                    assert_eq!(request_id, "res-1");
+                    assert_eq!(status, 200);
+                    assert_eq!(mime_type, "image/png");
+                    assert_eq!(length, png_magic.len() as u64);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_request, "SubresourceFetchRequest event missing");
+        assert!(saw_response, "SubresourceFetchResponse event missing");
+
+        // HAR 1.2 export: one entry per request, real response metadata.
+        let har = session.network_log_har();
+        assert_eq!(har["log"]["version"], "1.2");
+        assert_eq!(har["log"]["creator"]["name"], "oxibrowser");
+        let entries = har["log"]["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "one HAR entry per request");
+        assert_eq!(entries[0]["request"]["url"], doc.url);
+        assert_eq!(entries[0]["response"]["status"], 200);
+        assert_eq!(entries[0]["response"]["content"]["mimeType"], "text/html");
+        assert_eq!(entries[1]["request"]["url"], img.url);
+        assert_eq!(entries[1]["response"]["content"]["mimeType"], "image/png");
+        assert_eq!(
+            entries[1]["response"]["content"]["size"],
+            png_magic.len() as i64
+        );
+
+        // clear_network_log empties the log (and the HAR export).
+        session.clear_network_log();
+        assert!(session.network_log_snapshot().is_empty());
+    }
+
+    /// W4a: JS-issued `fetch` requests flow through the bridge with the
+    /// session's request overrides applied on the wire, and land in the
+    /// request log under the `oxi-{n}` id namespace (matching the
+    /// `Network.requestWillBeSent` events minted on the JS thread).
+    #[tokio::test]
+    async fn test_js_fetch_bridge_applies_overrides_and_logs() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Only reachable with the override UA — a 200 proves the override
+        // reached the wire through the fetch bridge.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"<html><body></body></html>".to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(header("user-agent", "BridgeUA/1.0"))
+            .and(path("/api"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"{\"ok\":true}".to_vec(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut session = make_session().await;
+        session.set_overrides(RequestOverrides {
+            user_agent: Some("BridgeUA/1.0".into()),
+            extra_headers: vec![("X-Test".to_string(), "1".to_string())],
+        });
+        session
+            .navigate(&format!("{}/", server.uri()))
+            .await
+            .expect("navigate");
+
+        let body = session
+            .evaluate_js_with_await(
+                // NOTE: the runtime's fetch() only forwards an allowlist of
+                // header names (content-type/accept/authorization/user-agent/
+                // cookie); use one of those so the header reaches the bridge.
+                "fetch('/api', {headers: {'accept': 'application/json'}}).then(r => r.text())",
+                true,
+            )
+            .await
+            .expect("js fetch through bridge");
+        assert_eq!(body.value, Some(serde_json::json!("{\"ok\":true}")));
+
+        // The bridge record: oxi-1 (first JS fetch id), finished with the
+        // real response metadata.
+        let log = session.network_log_snapshot();
+        let fetch_record = log
+            .iter()
+            .find(|r| r.request_id == "oxi-1")
+            .expect("js fetch record in network log");
+        assert_eq!(fetch_record.method, "GET");
+        assert_eq!(fetch_record.resource_type, "Fetch");
+        assert!(
+            fetch_record.url.ends_with("/api"),
+            "url: {}",
+            fetch_record.url
+        );
+        assert_eq!(fetch_record.status, Some(200));
+        assert_eq!(fetch_record.mime_type, "application/json");
+        assert_eq!(
+            fetch_record.response_body_length,
+            Some(b"{\"ok\":true}".len() as u64)
+        );
+        assert!(fetch_record.finished_at_ms.is_some());
+        assert!(
+            fetch_record
+                .request_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v == "application/json"),
+            "JS request headers forwarded to the log, got: {:?}",
+            fetch_record.request_headers
         );
     }
 }

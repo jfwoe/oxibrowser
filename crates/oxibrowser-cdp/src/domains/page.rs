@@ -2,7 +2,8 @@
 //!
 //! Handles Page.enable, Page.disable, Page.navigate, Page.reload,
 //! Page.getFrameTree, Page.getFrameMetrics, Page.captureScreenshot,
-//! Page.printToPDF, and the screencast subset (Page.startScreencast,
+//! Page.printToPDF, Page.getNavigationHistory, Page.getLifecycleEvents,
+//! and the screencast subset (Page.startScreencast,
 //! Page.stopScreencast, Page.screencastFrameAck).
 //!
 //! After Page.enable, navigation events are emitted:
@@ -46,20 +47,24 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "stopScreencast" => stop_screencast(ctx),
         "screencastFrameAck" => screencast_frame_ack(params),
         "setDownloadBehavior" => set_download_behavior(params),
-        "getLifecycleEvents" => Ok(Some(json!({ "events": [] }))),
+        "getLifecycleEvents" => get_lifecycle_events(ctx),
         "setLifecycleEventsEnabled" => set_lifecycle_events_enabled(params, ctx),
         // Dialog handling: alert/confirm/prompt default to non-blocking
         // (no-throw), so acknowledging the dialog is a no-op ack.
         // Resolve a pending alert/confirm/prompt. The page's JS thread blocks
         // polling the dialog gate until this writes the resolution.
         "handleJavaScriptDialog" => handle_javascript_dialog(params, ctx).await,
+        "addScriptToEvaluateOnNewDocument" => {
+            add_script_to_evaluate_on_new_document(params, ctx).await
+        }
+        "removeScriptToEvaluateOnNewDocument" => {
+            remove_script_to_evaluate_on_new_document(params, ctx).await
+        }
         // Common Playwright/Puppeteer Page methods — acknowledged as no-ops so
         // they don't 404 the client. Real implementations land per phase.
-        "addScriptToEvaluateOnNewDocument" => Ok(Some(json!({ "identifier": "0" }))),
-        "removeScriptToEvaluateOnNewDocument" => Ok(Some(json!({}))),
-        "bringToFront" => Ok(Some(json!({}))),
-        "getNavigationHistory" => Ok(Some(json!({ "currentIndex": 0, "entries": [] }))),
-        "setBypassCSP" => Ok(Some(json!({}))),
+        "bringToFront" => bring_to_front(),
+        "getNavigationHistory" => get_navigation_history(ctx).await,
+        "setBypassCSP" => set_bypass_csp(),
         _ => Err(CdpError {
             code: -32601,
             message: format!("Page.{} not implemented", method),
@@ -90,6 +95,74 @@ fn set_lifecycle_events_enabled(params: Option<Value>, ctx: &DispatchContext) ->
     Ok(Some(json!({})))
 }
 
+/// Page.getNavigationHistory — returns the session's navigation history.
+///
+/// Entry ids are 1-based positions. Only the current entry carries the page
+/// title (the session tracks one loaded document); other entries report an
+/// empty title. Every entry uses the `link` transition type since redirect
+/// chains are not recorded.
+async fn get_navigation_history(ctx: &DispatchContext) -> DomainResult {
+    let guard = ctx.session.read().await;
+    let current_index = guard.history_index();
+    let current_title = guard.page().and_then(|p| p.title()).unwrap_or("");
+    let entries: Vec<Value> = guard
+        .history()
+        .iter()
+        .enumerate()
+        .map(|(i, url)| {
+            json!({
+                "id": i + 1,
+                "url": url.as_str(),
+                "userTypedURL": url.as_str(),
+                "title": if i == current_index { current_title } else { "" },
+                "transitionType": "link",
+            })
+        })
+        .collect();
+    Ok(Some(json!({
+        "currentIndex": current_index,
+        "entries": entries,
+    })))
+}
+
+/// Page.getLifecycleEvents — returns the buffered lifecycle events.
+///
+/// While the lifecycle flag is enabled (`Page.enable` or
+/// `Page.setLifecycleEventsEnabled(true)`), the three navigation lifecycle
+/// events are buffered, keeping the most recent 20. Each entry reports the
+/// synthetic `main` frame and the event name without its `Page.` prefix.
+fn get_lifecycle_events(ctx: &DispatchContext) -> DomainResult {
+    let events: Vec<Value> = ctx
+        .events
+        .lifecycle_events()
+        .into_iter()
+        .map(|(method, _params, timestamp)| {
+            json!({
+                "frameId": "main",
+                "name": method.strip_prefix("Page.").unwrap_or(method.as_str()),
+                "timestamp": timestamp,
+            })
+        })
+        .collect();
+    Ok(Some(json!({ "events": events })))
+}
+
+/// Page.setBypassCSP — accepted as a no-op.
+///
+/// The engine never enforces CSP in the first place, so there is no bypass
+/// state to toggle; the call always succeeds.
+fn set_bypass_csp() -> DomainResult {
+    Ok(Some(json!({})))
+}
+
+/// Page.bringToFront — accepted as a no-op.
+///
+/// There is no OS window or tab-visibility concept, so every target is
+/// always effectively frontmost; nothing to activate.
+fn bring_to_front() -> DomainResult {
+    Ok(Some(json!({})))
+}
+
 /// Page.navigate — navigates to a URL using the real browser session.
 ///
 /// Emits events in correct CDP order:
@@ -110,16 +183,22 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
     let loader_id = format!("LID-{}", uuid::Uuid::new_v4().as_simple());
     let request_id = format!("REQ-{}", uuid::Uuid::new_v4().as_simple());
 
-    // 1. Emit Network.requestWillBeSent FIRST (before navigation)
+    // 1. Emit Network.requestWillBeSent FIRST (before navigation).
+    // Only the event payload is redacted — `url` itself drives the real
+    // navigation below.
+    let event_url = oxibrowser_core::security::redact::redact_url_query(
+        url,
+        &oxibrowser_core::security::redact::active_profile(),
+    );
     let pre_timestamp = EventSender::timestamp_ms();
     ctx.events.send_network_event(
         "Network.requestWillBeSent",
         json!({
             "requestId": request_id,
             "loaderId": loader_id,
-            "documentURL": url,
+            "documentURL": event_url,
             "request": {
-                "url": url,
+                "url": event_url,
                 "method": "GET",
                 "headers": {},
                 "initialPriority": "VeryHigh",
@@ -311,15 +390,20 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     };
 
     // 2. Emit Network.requestWillBeSent FIRST with the current URL
+    // (event payload only — the reload itself uses the session's real URL).
+    let event_url = oxibrowser_core::security::redact::redact_url_query(
+        &current_url,
+        &oxibrowser_core::security::redact::active_profile(),
+    );
     let pre_timestamp = EventSender::timestamp_ms();
     ctx.events.send_network_event(
         "Network.requestWillBeSent",
         json!({
             "requestId": request_id,
             "loaderId": loader_id,
-            "documentURL": current_url,
+            "documentURL": event_url,
             "request": {
-                "url": current_url,
+                "url": event_url,
                 "method": "GET",
                 "headers": {},
                 "initialPriority": "VeryHigh",
@@ -464,7 +548,8 @@ fn get_frame_metrics() -> DomainResult {
 
 /// Page.captureScreenshot — captures a screenshot of the page.
 ///
-/// Renders the DOM as a PNG image using text-based rendering with bitmap font.
+/// Renders the live `RenderDocument` (Blitz + Stylo layout, vello_cpu raster,
+/// real fonts) via `Session::capture_screenshot_png` — full page.
 async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params = params.unwrap_or_default();
     let _format = params
@@ -478,12 +563,19 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
         .unwrap_or(1280.0) as u32;
 
     // Render the live (post-JS) RenderDocument via the JS thread. Falls back to
-    // a blank PNG if no document is loaded.
+    // a blank PNG if no document is loaded — except the password-focus capture
+    // guard, whose refusal must reach the client instead of a blank frame.
     let mut guard = ctx.session.write().await;
-    let png_bytes: Vec<u8> = guard
-        .capture_screenshot_png(viewport_width.max(64))
-        .await
-        .unwrap_or_else(|_| oxibrowser_core::blank_png(viewport_width.max(64), 800));
+    let png_bytes: Vec<u8> = match guard.capture_screenshot_png(viewport_width.max(64)).await {
+        Ok(png) => png,
+        Err(e)
+            if e.to_string()
+                .contains(oxibrowser_core::session::CAPTURE_BLOCKED_MSG) =>
+        {
+            return Err(e.into());
+        }
+        Err(_) => oxibrowser_core::blank_png(viewport_width.max(64), 800),
+    };
 
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
@@ -532,10 +624,18 @@ async fn print_to_pdf(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
         .unwrap_or(1280.0) as u32;
 
     let mut guard = ctx.session.write().await;
-    let png_bytes: Vec<u8> = guard
-        .capture_screenshot_png(viewport_width.max(64))
-        .await
-        .unwrap_or_else(|_| oxibrowser_core::blank_png(viewport_width.max(64), 800));
+    let png_bytes: Vec<u8> = match guard.capture_screenshot_png(viewport_width.max(64)).await {
+        Ok(png) => png,
+        // Same guard as captureScreenshot: a password-focus refusal must not
+        // silently become a blank-PDF page.
+        Err(e)
+            if e.to_string()
+                .contains(oxibrowser_core::session::CAPTURE_BLOCKED_MSG) =>
+        {
+            return Err(e.into());
+        }
+        Err(_) => oxibrowser_core::blank_png(viewport_width.max(64), 800),
+    };
     drop(guard);
 
     let landscape = params
@@ -579,6 +679,62 @@ fn set_download_behavior(params: Option<Value>) -> DomainResult {
         path.map(std::path::PathBuf::from)
     };
     oxibrowser_core::session::set_download_behavior(dir);
+    Ok(Some(json!({})))
+}
+
+/// Page.addScriptToEvaluateOnNewDocument — register a script that runs before
+/// any page script on every subsequent document (navigations and reloads).
+///
+/// Returns `{"identifier": id}`; pass that id to
+/// `Page.removeScriptToEvaluateOnNewDocument`. Only `source` is honored —
+/// `worldName`/`runImmediately` are not (scripts always run in the main
+/// world at document start).
+async fn add_script_to_evaluate_on_new_document(
+    params: Option<Value>,
+    ctx: &DispatchContext,
+) -> DomainResult {
+    let params = params.ok_or_else(|| CdpError {
+        code: -32602,
+        message: "addScriptToEvaluateOnNewDocument requires parameters".to_string(),
+    })?;
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "source required".to_string(),
+        })?;
+    let identifier = ctx
+        .session
+        .write()
+        .await
+        .add_init_script(source.to_string());
+    tracing::debug!(identifier = %identifier, "Page.addScriptToEvaluateOnNewDocument");
+    Ok(Some(json!({ "identifier": identifier })))
+}
+
+/// Page.removeScriptToEvaluateOnNewDocument — drop a previously registered
+/// init script.
+///
+/// Like Chrome, removing an unknown identifier still succeeds: the reply is
+/// always `{}` whether or not the script existed.
+async fn remove_script_to_evaluate_on_new_document(
+    params: Option<Value>,
+    ctx: &DispatchContext,
+) -> DomainResult {
+    let params = params.ok_or_else(|| CdpError {
+        code: -32602,
+        message: "removeScriptToEvaluateOnNewDocument requires parameters".to_string(),
+    })?;
+    let identifier = params
+        .get("identifier")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "identifier required".to_string(),
+        })?;
+    let removed = ctx.session.write().await.remove_init_script(identifier);
+    tracing::debug!(identifier = %identifier, removed, "Page.removeScriptToEvaluateOnNewDocument");
     Ok(Some(json!({})))
 }
 

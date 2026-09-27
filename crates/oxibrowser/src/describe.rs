@@ -12,7 +12,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
         CliResponse::success(serde_json::json!({
             "fetch": {
                 "args": ["url"],
-                "flags": ["format","json","max-bytes","fields","summary","eval","click","fill","press","wait","wait-timeout","extract","all","headers","timeout"]
+                "flags": ["format","json","max-bytes","fields","summary","eval","click","fill","press","wait","wait-timeout","extract","all","headers","timeout","har","telemetry","allow-private-ips"]
             },
             "extract": {
                 "args": ["url"],
@@ -22,10 +22,10 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "args": ["script"]
             },
             "session": {
-                "commands": ["new","goto","back","forward","reload","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","close","list","help","exit"]
+                "commands": ["new","goto","back","forward","reload","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","save-state","load-state","close","list","help","exit"]
             },
             "serve": {
-                "flags": ["host","port","cookie-file"]
+                "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp"]
             },
             "describe": {
                 "args": ["command?"],
@@ -64,7 +64,10 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "extract": {"type": "string", "description": "Extract text from CSS selector instead of full content"},
                         "all": {"type": "bool", "description": "With --extract: return all matches"},
                         "headers": {"type": "bool", "description": "Print HTTP headers to stderr"},
-                        "timeout": {"type": "int", "default": 30, "unit": "seconds"}
+                        "timeout": {"type": "int", "default": 30, "unit": "seconds"},
+                        "har": {"type": "string", "description": "Write a HAR 1.2 file of all recorded requests to this path"},
+                        "telemetry": {"type": "bool", "description": "Record Web APIs the page uses but oxibrowser lacks; reported in meta.api_gaps"},
+                        "allow-private-ips": {"type": "bool", "description": "Disable the SSRF filter (needed for localhost targets)"}
                     },
                     "output_schema": {
                         "type": "object",
@@ -130,6 +133,8 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "content": {"args": ["tab_id"], "flags": ["format","fields","max-bytes","summary"], "description": "Get page content"},
                         "screenshot": {"args": ["tab_id"], "flags": ["output","width","base64"], "description": "Take screenshot"},
                         "wait": {"args": ["tab_id", "selector"], "flags": ["timeout"], "description": "Wait for selector"},
+                        "save-state": {"args": ["path"], "description": "Export cookies + localStorage as Playwright-compatible storageState JSON"},
+                        "load-state": {"args": ["path"], "description": "Import a storageState snapshot (applies to the next navigation)"},
                         "close": {"args": ["tab_id"], "description": "Close tab (or --all)"},
                         "list": {"description": "List active tabs"},
                         "help": {"description": "Show session command help"},
@@ -142,7 +147,11 @@ pub fn describe_all(compact: bool) -> CliResponse {
                     "flags": {
                         "host": {"type": "string", "default": "127.0.0.1"},
                         "port": {"type": "int", "default": 9222},
-                        "cookie-file": {"type": "string", "description": "Cookie persistence file path"}
+                        "cookie-file": {"type": "string", "description": "Cookie persistence file path"},
+                        "allow-private-ips": {"type": "bool", "description": "Disable the SSRF filter (localhost targets)"},
+                        "proxy": {"type": "string", "description": "HTTP/HTTPS/SOCKS proxy for all requests"},
+                        "auth-token": {"type": "string", "description": "WebSocket auth token (required for non-loopback bind)"},
+                        "mcp": {"type": "bool", "description": "Serve as a stdio MCP server (JSON-RPC 2.0) instead of CDP"}
                     }
                 },
                 "describe": {

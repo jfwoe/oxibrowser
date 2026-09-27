@@ -16,10 +16,10 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "setDiscoverTargets" => set_discover_targets(params, ctx),
         "setAutoAttach" => set_auto_attach(params, ctx),
         "attachToTarget" => attach_to_target(params, ctx),
-        "detachFromTarget" => Ok(Some(json!({}))),
+        "detachFromTarget" => detach_from_target(params, ctx).await,
         "createTarget" => create_target(params, ctx).await,
-        "closeTarget" => Ok(Some(json!({ "success": true }))),
-        "getTargets" => get_targets(),
+        "closeTarget" => close_target(params, ctx).await,
+        "getTargets" => get_targets(ctx).await,
         "getTargetInfo" => get_target_info(params),
         _ => Err(CdpError {
             code: -32601,
@@ -150,7 +150,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
     }
     let child_events = ctx.events.clone();
     let child_sid = session_id.clone();
-    tokio::spawn(async move {
+    let drain_handle = tokio::spawn(async move {
         loop {
             match core_rx.try_recv() {
                 Ok(ev) => {
@@ -166,9 +166,15 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
 
     // Register the child session so commands routed by sessionId reach it.
     ctx.child_targets
-        .write()
-        .await
-        .insert(session_id.clone(), new_session.clone());
+        .insert(
+            session_id.clone(),
+            crate::domains::TargetEntry {
+                target_id: target_id.clone(),
+                session: new_session.clone(),
+                drain_abort: Some(drain_handle.abort_handle()),
+            },
+        )
+        .await;
 
     ctx.events.send_event(
         "Target.targetCreated",
@@ -206,21 +212,96 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
     })))
 }
 
+/// Target.closeTarget — closes a child target created via `Target.createTarget`.
+///
+/// Aborts the child's event drainer, closes the child session, removes it from
+/// the registry, and emits `Target.detachedFromTarget` then
+/// `Target.targetDestroyed`. Unknown `targetId` yields a `-32001` error.
+async fn close_target(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let target_id = params
+        .get("targetId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let (session_id, entry) = ctx
+        .child_targets
+        .close_by_target(target_id)
+        .await
+        .ok_or_else(|| CdpError {
+            code: -32001,
+            message: "target not found".to_string(),
+        })?;
+
+    if let Some(handle) = entry.drain_abort.as_ref() {
+        handle.abort();
+    }
+    entry
+        .session
+        .write()
+        .await
+        .close()
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: format!("failed to close target: {e}"),
+        })?;
+
+    ctx.events.send_event(
+        "Target.detachedFromTarget",
+        json!({ "sessionId": session_id }),
+    );
+    ctx.events
+        .send_event("Target.targetDestroyed", json!({ "targetId": target_id }));
+
+    Ok(Some(json!({ "targetId": target_id, "success": true })))
+}
+
+/// Target.detachFromTarget — detaches from a child target session.
+///
+/// Aborts the child's event drainer and removes it from the registry; the
+/// child session itself stays alive.
+async fn detach_from_target(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let session_id = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    if let Some(entry) = ctx.child_targets.detach(session_id).await
+        && let Some(handle) = entry.drain_abort.as_ref()
+    {
+        handle.abort();
+    }
+
+    Ok(Some(json!({})))
+}
+
 /// Target.getTargets — returns list of available targets.
-fn get_targets() -> DomainResult {
-    Ok(Some(json!({
-        "targetInfos": [
-            {
-                "targetId": "default",
-                "type": "page",
-                "title": "OxiBrowser",
-                "url": "about:blank",
-                "attached": false,
-                "canAccessOpener": false,
-                "browserContextId": "default"
-            }
-        ]
-    })))
+///
+/// Lists the root `default` target plus every registered child target.
+async fn get_targets(ctx: &DispatchContext) -> DomainResult {
+    let mut infos = vec![json!({
+        "targetId": "default",
+        "type": "page",
+        "title": "OxiBrowser",
+        "url": "about:blank",
+        "attached": false,
+        "canAccessOpener": false,
+        "browserContextId": "default"
+    })];
+    for (_, entry) in ctx.child_targets.entries().await {
+        infos.push(json!({
+            "targetId": entry.target_id,
+            "type": "page",
+            "title": "about:blank",
+            "url": "about:blank",
+            "attached": true,
+            "canAccessOpener": false,
+            "browserContextId": "default"
+        }));
+    }
+    Ok(Some(json!({ "targetInfos": infos })))
 }
 
 /// Target.getTargetInfo — returns info about a specific target.
@@ -242,4 +323,63 @@ fn get_target_info(params: Option<Value>) -> DomainResult {
             "browserContextId": "default"
         }
     })))
+}
+
+#[cfg(test)]
+mod tests {
+
+    use oxibrowser_core::{Browser, BrowserConfig};
+    use std::sync::Arc;
+
+    /// Registry close/detach lifecycle against a real child session.
+    #[tokio::test]
+    async fn registry_close_and_detach_lifecycle() {
+        let config = BrowserConfig::headless();
+        let browser = Arc::new(Browser::new(config).await.unwrap());
+        let session = browser.new_session().await.unwrap();
+
+        let registry = crate::domains::TargetRegistry::new();
+        registry
+            .insert(
+                "session-a".into(),
+                crate::domains::TargetEntry {
+                    target_id: "TID-a".into(),
+                    session: session.clone(),
+                    drain_abort: None,
+                },
+            )
+            .await;
+        registry
+            .insert(
+                "session-b".into(),
+                crate::domains::TargetEntry {
+                    target_id: "TID-b".into(),
+                    session: session.clone(),
+                    drain_abort: None,
+                },
+            )
+            .await;
+
+        // get() resolves by sessionId.
+        let entry = registry.get("session-a").await.unwrap();
+        assert_eq!(entry.target_id, "TID-a");
+        assert!(registry.get("missing").await.is_none());
+
+        // close_by_target resolves the sessionId and removes the entry.
+        let (sid, entry) = registry.close_by_target("TID-b").await.unwrap();
+        assert_eq!(sid, "session-b");
+        assert_eq!(entry.target_id, "TID-b");
+        assert!(registry.get("session-b").await.is_none());
+        assert!(registry.close_by_target("TID-b").await.is_none());
+
+        // Closing marks the child session closed.
+        entry.session.write().await.close().await.unwrap();
+        assert!(entry.session.read().await.is_closed());
+
+        // detach removes only the requested session.
+        let detached = registry.detach("session-a").await.unwrap();
+        assert_eq!(detached.target_id, "TID-a");
+        assert!(registry.detach("session-a").await.is_none());
+        assert!(registry.entries().await.is_empty());
+    }
 }

@@ -11,6 +11,7 @@ use crate::error::{CoreError, Result};
 use crate::network::cookie::CookieJar;
 use crate::network::intercept::{InterceptAction, InterceptedBody, InterceptedResponse};
 use crate::network::ip_filter::IpFilter;
+use crate::session::RequestOverrides;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use url::Url;
@@ -30,6 +31,69 @@ fn check_url_ssrf(url: &Url, filter: &IpFilter) -> bool {
         return filter.is_hostname_allowed(host);
     }
     true
+}
+
+/// Headers a caller may not override per-request: `Cookie` (owned by the
+/// cookie jar), `Host` and `Content-Length` (derived from the connection and
+/// body by the client/protocol — user values would corrupt the framing).
+/// Matching is case-insensitive.
+fn is_transport_managed_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cookie" | "host" | "content-length"
+    )
+}
+
+/// Apply per-request [`RequestOverrides`] to a request builder.
+///
+/// - `user_agent` is set as a per-request `User-Agent` header, which wins over
+///   the client-level default UA (wreq inserts client defaults only when the
+///   request does not already carry the header).
+/// - `extra_headers` are appended **after** the default headers. When a UA
+///   override is active, a `User-Agent` entry in `extra_headers` is skipped so
+///   the wire carries exactly one UA (duplicate UA headers are a bot signal).
+fn apply_request_overrides(
+    mut builder: wreq::RequestBuilder,
+    ov: Option<&RequestOverrides>,
+) -> wreq::RequestBuilder {
+    let Some(ov) = ov else {
+        return builder;
+    };
+    if let Some(ua) = &ov.user_agent {
+        builder = builder.header("User-Agent", ua.as_str());
+    }
+    for (name, value) in &ov.extra_headers {
+        if is_transport_managed_header(name) {
+            tracing::trace!(header = %name, "skipping transport-managed override header");
+            continue;
+        }
+        if ov.user_agent.is_some() && name.eq_ignore_ascii_case("user-agent") {
+            tracing::trace!(header = %name, "skipping extra header shadowed by UA override");
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+}
+
+/// A fetched resource with full response metadata.
+///
+/// Returned by [`HttpClient::fetch_response_with_overrides`] so callers (the
+/// sub-resource loader) can record the real status / MIME type / headers of
+/// every page resource.
+#[derive(Debug, Clone)]
+pub struct FetchedResource {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response headers in wire order.
+    pub headers: Vec<(String, String)>,
+    /// MIME type from `Content-Type` with parameters stripped
+    /// (`text/html;charset=utf-8` → `text/html`); empty when absent.
+    pub mime_type: String,
+    /// Raw body bytes (subject to `max_response_body_bytes`).
+    pub body: Vec<u8>,
+    /// Final URL after redirects.
+    pub final_url: String,
 }
 
 /// HTTP client wrapper with cookie support and configurable defaults.
@@ -185,6 +249,18 @@ impl HttpClient {
     /// Fetch a URL and return the response.
     #[tracing::instrument(skip(self), err)]
     pub async fn fetch(&self, url: &Url) -> Result<Response> {
+        self.fetch_with_overrides(url, None).await
+    }
+
+    /// [`HttpClient::fetch`] with per-request overrides (UA + extra headers).
+    ///
+    /// See [`apply_request_overrides`] for precedence rules.
+    #[tracing::instrument(skip(self, ov), err)]
+    pub async fn fetch_with_overrides(
+        &self,
+        url: &Url,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
         self.check_ssrf(url)?;
 
         tracing::debug!(url = %url, "HTTP request started");
@@ -196,6 +272,7 @@ impl HttpClient {
         if !cookies.is_empty() {
             request = request.header("Cookie", cookies);
         }
+        request = apply_request_overrides(request, ov);
 
         let response = request
             .send()
@@ -221,6 +298,19 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
+        self.request_with_overrides(url, method, headers, body, None)
+            .await
+    }
+
+    /// [`HttpClient::request`] with per-request overrides (UA + extra headers).
+    pub async fn request_with_overrides(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: Option<Vec<u8>>,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
         use wreq::Method;
         use wreq::header::{HeaderName, HeaderValue};
 
@@ -245,6 +335,7 @@ impl HttpClient {
                 req_builder = req_builder.header(name, val);
             }
         }
+        req_builder = apply_request_overrides(req_builder, ov);
         if let Some(bytes) = body {
             req_builder = req_builder.body(bytes);
         }
@@ -278,7 +369,22 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
-        let response = self.request(url, method, headers, body.clone()).await?;
+        self.request_with_auth_with_overrides(url, method, headers, body, None)
+            .await
+    }
+
+    /// [`HttpClient::request_with_auth`] with per-request overrides.
+    pub async fn request_with_auth_with_overrides(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: Option<Vec<u8>>,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
+        let response = self
+            .request_with_overrides(url, method, headers, body.clone(), ov)
+            .await?;
         if response.status().as_u16() != 401 {
             return Ok(response);
         }
@@ -306,7 +412,8 @@ impl HttpClient {
                     .cloned()
                     .collect();
                 headers2.push(("Authorization".to_string(), auth));
-                self.request(url, method, &headers2, body).await
+                self.request_with_overrides(url, method, &headers2, body, ov)
+                    .await
             }
             None => Ok(response),
         }
@@ -326,6 +433,21 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<Vec<u8>>,
         origin: Option<&str>,
+    ) -> Result<Response> {
+        self.request_with_context_with_overrides(url, method, headers, body, origin, None)
+            .await
+    }
+
+    /// [`HttpClient::request_with_context`] with per-request overrides
+    /// (applied to the final request; preflight is unaffected).
+    pub async fn request_with_context_with_overrides(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: Option<Vec<u8>>,
+        origin: Option<&str>,
+        ov: Option<&RequestOverrides>,
     ) -> Result<Response> {
         let page_url = origin.and_then(|o| Url::parse(o).ok());
 
@@ -359,7 +481,8 @@ impl HttpClient {
             self.run_preflight(url, method, headers, origin).await?;
         }
 
-        self.request_with_auth(url, method, &eff, body).await
+        self.request_with_auth_with_overrides(url, method, &eff, body, ov)
+            .await
     }
 
     /// Send a CORS preflight `OPTIONS` and validate the response.
@@ -425,12 +548,12 @@ impl HttpClient {
 
     /// Fetch `url`, retrying while a bot-management challenge is detected.
     ///
-    /// Each attempt runs [`HttpClient::fetch`], reads the body, and runs
-    /// [`challenge::detect`]. With no challenge the outcome is returned at
-    /// once. When a challenge is detected the client backs off and retries —
-    /// re-sending any clearance cookie the cookie jar captured from a prior
-    /// attempt's `Set-Cookie` — up to `max_attempts`, then returns the final
-    /// outcome with the detected challenge.
+    /// Each attempt runs [`HttpClient::fetch_with_overrides`] with no
+    /// overrides, reads the body, and runs [`challenge::detect`]. With no
+    /// challenge the outcome is returned at once. When a challenge is
+    /// detected the client backs off and retries — re-sending any clearance cookie the cookie jar
+    /// captured from a prior attempt's `Set-Cookie` — up to `max_attempts`,
+    /// then returns the final outcome with the detected challenge.
     ///
     /// **This does not auto-execute challenge JS** (see [`crate::challenge`]).
     /// A retry only clears the challenge when the passive stealth tier already
@@ -448,7 +571,7 @@ impl HttpClient {
             challenge: None,
         };
         for attempt in 1..=max_attempts {
-            let response = self.fetch(url).await?;
+            let response = self.fetch_with_overrides(url, None).await?;
             let status = response.status().as_u16();
             let headers = Self::response_headers(&response);
             let max = self.config.max_response_body_bytes;
@@ -497,8 +620,9 @@ impl HttpClient {
         Ok(outcome)
     }
 
-    /// Collect response headers into a `(name, value)` slice for [`challenge::detect`].
-    fn response_headers(response: &Response) -> Vec<(String, String)> {
+    /// Collect response headers into a `(name, value)` slice for
+    /// [`challenge::detect`] and the session request log.
+    pub(crate) fn response_headers(response: &Response) -> Vec<(String, String)> {
         response
             .headers()
             .iter()
@@ -594,7 +718,17 @@ impl HttpClient {
     /// to detect the character encoding. Falls back to UTF-8.
     #[tracing::instrument(skip(self), err)]
     pub async fn fetch_text(&self, url: &Url) -> Result<String> {
-        let response = self.fetch(url).await?;
+        self.fetch_text_with_overrides(url, None).await
+    }
+
+    /// [`HttpClient::fetch_text`] with per-request overrides.
+    #[tracing::instrument(skip(self, ov), err)]
+    pub async fn fetch_text_with_overrides(
+        &self,
+        url: &Url,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<String> {
+        let response = self.fetch_with_overrides(url, ov).await?;
         let content_type = response
             .headers()
             .get("content-type")
@@ -614,7 +748,17 @@ impl HttpClient {
     /// @font-face font files. Applies the same body-size limit as `fetch_text`.
     #[tracing::instrument(skip(self), err)]
     pub async fn fetch_bytes(&self, url: &Url) -> Result<Vec<u8>> {
-        let response = self.fetch(url).await?;
+        self.fetch_bytes_with_overrides(url, None).await
+    }
+
+    /// [`HttpClient::fetch_bytes`] with per-request overrides.
+    #[tracing::instrument(skip(self, ov), err)]
+    pub async fn fetch_bytes_with_overrides(
+        &self,
+        url: &Url,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Vec<u8>> {
+        let response = self.fetch_with_overrides(url, ov).await?;
         let max = self.config.max_response_body_bytes;
         let (buf, truncated) = Self::read_body_limited(response, max).await?;
         if truncated {
@@ -623,15 +767,80 @@ impl HttpClient {
         Ok(buf)
     }
 
+    /// Fetch a URL and return the full response metadata plus body bytes.
+    ///
+    /// The metadata-carrying sibling of [`Self::fetch_bytes_with_overrides`]:
+    /// used by the sub-resource loader so page resources record the real HTTP
+    /// status and MIME type instead of hardcoded values. The body is subject
+    /// to the same `max_response_body_bytes` cap as every other convenience
+    /// fetch.
+    #[tracing::instrument(skip(self, ov), err)]
+    pub async fn fetch_response_with_overrides(
+        &self,
+        url: &Url,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<FetchedResource> {
+        let response = self.fetch_with_overrides(url, ov).await?;
+        let status = response.status().as_u16();
+        let headers = Self::response_headers(&response);
+        let mime_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(Self::mime_without_params)
+            .unwrap_or_default();
+        let final_url = response.uri().to_string();
+        let max = self.config.max_response_body_bytes;
+        let (body, truncated) = Self::read_body_limited(response, max).await?;
+        if truncated {
+            tracing::warn!(
+                url = %url,
+                max_bytes = max,
+                "sub-resource body truncated at size limit"
+            );
+        }
+        Ok(FetchedResource {
+            status,
+            headers,
+            mime_type,
+            body,
+            final_url,
+        })
+    }
+
+    /// Strip RFC 9110 parameters (`; charset=utf-8`, …) from a `Content-Type`
+    /// value, leaving the bare MIME type.
+    pub(crate) fn mime_without_params(content_type: &str) -> String {
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_string()
+    }
+
     /// Send a POST request with a raw body.
     #[tracing::instrument(skip(self, body), err)]
     pub async fn post(&self, url: &Url, body: impl Into<wreq::Body>) -> Result<Response> {
+        self.post_with_overrides(url, body, None).await
+    }
+
+    /// [`HttpClient::post`] with per-request overrides. `body` is converted
+    /// before the async boundary, so `impl Into<wreq::Body>` needs no
+    /// extra lifetime gymnastics.
+    #[tracing::instrument(skip(self, body), err)]
+    pub async fn post_with_overrides(
+        &self,
+        url: &Url,
+        body: impl Into<wreq::Body>,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
         self.check_ssrf(url)?;
 
-        let response = self
-            .client
-            .post(url.as_str())
-            .body(body)
+        let mut request = self.client.post(url.as_str()).body(body);
+        request = apply_request_overrides(request, ov);
+
+        let response = request
             .send()
             .await
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
@@ -644,12 +853,23 @@ impl HttpClient {
     /// Send a POST request with a JSON body.
     #[tracing::instrument(skip(self, json), err)]
     pub async fn post_json(&self, url: &Url, json: &serde_json::Value) -> Result<Response> {
+        self.post_json_with_overrides(url, json, None).await
+    }
+
+    /// [`HttpClient::post_json`] with per-request overrides.
+    #[tracing::instrument(skip(self, json), err)]
+    pub async fn post_json_with_overrides(
+        &self,
+        url: &Url,
+        json: &serde_json::Value,
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
         self.check_ssrf(url)?;
 
-        let response = self
-            .client
-            .post(url.as_str())
-            .json(json)
+        let mut request = self.client.post(url.as_str()).json(json);
+        request = apply_request_overrides(request, ov);
+
+        let response = request
             .send()
             .await
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
@@ -662,12 +882,23 @@ impl HttpClient {
     /// Send a POST request with URL-encoded form data.
     #[tracing::instrument(skip(self, form), err)]
     pub async fn post_form(&self, url: &Url, form: &[(&str, &str)]) -> Result<Response> {
+        self.post_form_with_overrides(url, form, None).await
+    }
+
+    /// [`HttpClient::post_form`] with per-request overrides.
+    #[tracing::instrument(skip(self, form), err)]
+    pub async fn post_form_with_overrides(
+        &self,
+        url: &Url,
+        form: &[(&str, &str)],
+        ov: Option<&RequestOverrides>,
+    ) -> Result<Response> {
         self.check_ssrf(url)?;
 
-        let response = self
-            .client
-            .post(url.as_str())
-            .form(form)
+        let mut request = self.client.post(url.as_str()).form(form);
+        request = apply_request_overrides(request, ov);
+
+        let response = request
             .send()
             .await
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
@@ -755,6 +986,104 @@ mod tests {
     }
 
     #[test]
+    fn transport_managed_headers_are_matched_case_insensitively() {
+        for name in [
+            "Cookie",
+            "COOKIE",
+            "cookie",
+            "Host",
+            "host",
+            "HOST",
+            "Content-Length",
+            "content-length",
+            "CONTENT-LENGTH",
+        ] {
+            assert!(
+                is_transport_managed_header(name),
+                "{name} must be transport-managed"
+            );
+        }
+        for name in [
+            "X-Custom",
+            "user-agent",
+            "Accept",
+            "Content-Type",
+            "Set-Cookie",
+        ] {
+            assert!(
+                !is_transport_managed_header(name),
+                "{name} must be caller-overridable"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_request_overrides_skips_transport_managed_headers() {
+        let ov = RequestOverrides {
+            user_agent: Some("TestUA/1.0".to_string()),
+            extra_headers: vec![
+                ("X-Custom".to_string(), "yes".to_string()),
+                ("Cookie".to_string(), "attacker=1".to_string()),
+                ("host".to_string(), "evil.example".to_string()),
+                ("CONTENT-LENGTH".to_string(), "9999".to_string()),
+                ("User-Agent".to_string(), "ShadowUA/2.0".to_string()),
+            ],
+        };
+        // apply_request_overrides filters by name; verify through the builder's
+        // header map (wreq RequestBuilder exposes headers via `headers` only
+        // after `build()`, so inspect the built request).
+        let client = make_client();
+        let url = Url::parse("https://example.com/").unwrap();
+        let builder = client.raw_client().get(url.as_str());
+        let builder = apply_request_overrides(builder, Some(&ov));
+        let req = builder.build().expect("request should build");
+
+        let names: Vec<String> = req
+            .headers()
+            .iter()
+            .map(|(k, _)| k.as_str().to_ascii_lowercase())
+            .collect();
+        assert!(
+            !names.contains(&"cookie".to_string()),
+            "Cookie must be skipped"
+        );
+        assert!(!names.contains(&"host".to_string()), "Host must be skipped");
+        assert!(
+            !names.contains(&"content-length".to_string()),
+            "Content-Length must be skipped"
+        );
+        // Custom header survives.
+        assert_eq!(
+            req.headers().get("x-custom").and_then(|v| v.to_str().ok()),
+            Some("yes")
+        );
+        // UA override wins — exactly one User-Agent, and it is the override.
+        let uas: Vec<&wreq::header::HeaderValue> =
+            req.headers().get_all("user-agent").iter().collect();
+        assert_eq!(uas.len(), 1, "exactly one User-Agent expected");
+        assert_eq!(uas[0], "TestUA/1.0");
+    }
+
+    #[test]
+    fn apply_request_overrides_none_is_noop() {
+        let client = make_client();
+        let url = Url::parse("https://example.com/").unwrap();
+        let bare = client
+            .raw_client()
+            .get(url.as_str())
+            .build()
+            .expect("request should build");
+        let applied = apply_request_overrides(client.raw_client().get(url.as_str()), None)
+            .build()
+            .expect("request should build");
+        assert_eq!(
+            bare.headers().len(),
+            applied.headers().len(),
+            "None override must not add headers"
+        );
+    }
+
+    #[test]
     fn test_check_url_ssrf_allows_public() {
         let filter = IpFilter::block_private();
         let url = Url::parse("http://93.184.216.34/").unwrap();
@@ -791,7 +1120,6 @@ mod tests {
             buf.extend_from_slice(&tmp[..n]);
         }
         let text = String::from_utf8_lossy(&buf).to_string();
-        let request_line = text.lines().next().unwrap_or("").to_string();
         let header_end = text.find("\r\n\r\n").unwrap_or(text.len());
         let content_length = text[..header_end]
             .lines()
@@ -809,7 +1137,9 @@ mod tests {
             }
             body.extend_from_slice(&tmp[..n]);
         }
-        *captured.lock() = Some((request_line, String::from_utf8_lossy(&body).to_string()));
+        // Store the full request text (request line + headers + any body
+        // bytes already read) so tests can assert on individual headers.
+        *captured.lock() = Some((text, String::from_utf8_lossy(&body).to_string()));
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.shutdown().await;
@@ -855,6 +1185,69 @@ mod tests {
         let (line, body) = captured.lock().clone().expect("server captured no request");
         assert!(line.starts_with("POST /post"), "expected POST, got: {line}");
         assert_eq!(body, "hello body", "body not delivered on the wire");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_with_overrides_sends_ua_and_extra_headers_on_the_wire() {
+        let captured: Arc<parking_lot::Mutex<Option<(String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+        let cap = captured.clone();
+        tokio::spawn(capture_one_request(addr_tx, cap));
+        let addr = addr_rx.recv().expect("server bound");
+
+        let config = BrowserConfig {
+            enable_ssrf_filter: false,
+            ..BrowserConfig::headless()
+        };
+        let jar = Arc::new(RwLock::new(CookieJar::new()));
+        let client = HttpClient::new(&config, jar).unwrap();
+
+        let ov = RequestOverrides {
+            user_agent: Some("WireUA/2.0".to_string()),
+            extra_headers: vec![
+                ("X-Probe".to_string(), "on".to_string()),
+                // Transport-managed: must NOT appear on the wire.
+                ("Cookie".to_string(), "injected=1".to_string()),
+            ],
+        };
+        let url = Url::parse(&format!("http://{addr}/ua")).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            client.fetch_with_overrides(&url, Some(&ov)),
+        )
+        .await
+        .expect("fetch_with_overrides timed out");
+        let result = result.expect("fetch failed");
+        assert_eq!(result.status().as_u16(), 200);
+
+        for _ in 0..50 {
+            if captured.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (line, _) = captured.lock().clone().expect("server captured no request");
+        assert!(line.starts_with("GET /ua"), "expected GET /ua, got: {line}");
+
+        let raw = line.to_ascii_lowercase();
+        // Exactly one User-Agent reaches the wire, and it is the per-request
+        // override (per-request headers beat the client-level default UA).
+        let ua_lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| l.starts_with("user-agent:"))
+            .collect();
+        assert_eq!(ua_lines.len(), 1, "exactly one UA header expected");
+        assert!(
+            ua_lines[0].contains("wireua/2.0"),
+            "override UA must win on the wire, got: {}",
+            ua_lines[0]
+        );
+        assert!(raw.contains("x-probe: on"), "extra header must be sent");
+        assert!(
+            !raw.contains("cookie:"),
+            "transport-managed Cookie must be skipped, got: {raw}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

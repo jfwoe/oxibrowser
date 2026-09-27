@@ -12,6 +12,7 @@ pub fn skill_text() -> &'static str {
 1. **One-shot**: `oxibrowser fetch <url> [flags]` or `oxibrowser extract <url> [flags]`
 2. **Automation**: `oxibrowser run <script.yaml>`
 3. **Interactive**: `oxibrowser session --json` (stdin commands, stdout JSON)
+4. **Server**: `oxibrowser serve` (CDP for Puppeteer/Playwright) or `oxibrowser serve --mcp` (stdio MCP tools: navigate/observe/click/fill/eval/read/wait/screenshot)
 
 ## Invariant Rules
 
@@ -59,7 +60,34 @@ oxibrowser fetch <url> --extract "h1" --json
 
 ## Session Commands
 
-`new`, `goto`, `back`, `forward`, `reload`, `click`, `fill`, `press`, `type`, `select`, `check`, `scroll`, `eval`, `extract`, `content`, `screenshot`, `wait`, `close`, `list`, `help`, `exit`
+`new`, `goto`, `back`, `forward`, `reload`, `click`, `fill`, `press`, `type`, `select`, `check`, `scroll`, `eval`, `extract`, `content`, `screenshot`, `wait`, `save-state <path>`, `load-state <path>`, `close`, `list`, `help`, `exit`
+
+## Storage State
+
+Login/session reuse (Playwright-compatible JSON):
+- `save-state <path>` — export cookies + localStorage
+- `load-state <path>` — import; applies from the next navigation
+- Over CDP: `OXI.exportStorageState` / `OXI.importStorageState`
+
+## Ref Loop (CDP) — cheapest agent interaction
+
+1. `OXI.getInteractiveElements` → each element carries a stable `ref` (`e1`, `e2`, …)
+2. Act by ref: `OXI.clickRef {ref}`, `OXI.fillRef {ref, value}`, `OXI.waitRef {ref, timeoutMs}`
+3. Document changed → refs go stale → error says "re-observe". Re-run step 1.
+4. `OXI.ariaSnapshot` → YAML tree with `[ref=eN]` annotations (visibility-filtered)
+
+## New in fetch / serve
+
+```bash
+# HAR 1.2 of every request made while fetching
+oxibrowser fetch <url> --har out.har --json
+
+# Report Web APIs the page needs but oxibrowser lacks (meta.api_gaps)
+oxibrowser fetch <url> --telemetry --json
+
+# localhost targets (SSRF filter off) — fetch, session, serve, serve --mcp
+oxibrowser fetch http://127.0.0.1:8080/ --allow-private-ips --json
+```
 
 ## Output Format
 

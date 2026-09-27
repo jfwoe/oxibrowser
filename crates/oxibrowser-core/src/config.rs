@@ -223,11 +223,32 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub cookie_file: Option<PathBuf>,
 
+    /// Dispose of the in-memory cookie jar when the browser closes
+    /// (default `true`). `cookie_file` persistence still happens before the
+    /// clear — this only prevents in-memory session remnants from outliving
+    /// the browser's lifetime in long-running hosts.
+    #[serde(default = "default_true")]
+    pub clear_cookies_on_close: bool,
+
     /// Maximum HTTP response body size in bytes (default 10 MiB).
     /// Responses larger than this are truncated at the limit; truncation is
     /// logged but not treated as an error.
     #[serde(default = "default_max_response_body")]
     pub max_response_body_bytes: usize,
+
+    /// Directory for saving downloads (`Content-Disposition: attachment`
+    /// responses). `None` = the platform temp dir resolved at save time via
+    /// [`BrowserConfig::download_dir_or_default`] (the directory itself is
+    /// created lazily when the first download is saved).
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
+
+    /// 미지원/폴리필 Web API 접근을 카운트해 리포트한다. 활성화하면 JS
+    /// 스레드의 `window` 객체가 카운팅 `Proxy`로 래핑되고, 대상 객체에
+    /// 존재하지 않는 프로퍼티(≈ 미구현 Web API) 접근이 `OXI.getApiGaps`와
+    /// fetch `--json` `meta.api_gaps`로 집계된다. 기본값 `false`.
+    #[serde(default)]
+    pub telemetry: bool,
 }
 
 impl Default for BrowserConfig {
@@ -256,12 +277,25 @@ impl Default for BrowserConfig {
             nav_script_max_stack_size: default_nav_script_max_stack_size(),
             navigation_timeout_ms: default_navigation_timeout_ms(),
             cookie_file: None,
+            clear_cookies_on_close: true,
             max_response_body_bytes: default_max_response_body(),
+            download_dir: None,
+            telemetry: false,
         }
     }
 }
 
 impl BrowserConfig {
+    /// Resolve the download directory for `Content-Disposition: attachment`
+    /// saves: the configured [`BrowserConfig::download_dir`], or the platform
+    /// temp dir's `oxibrowser-downloads` folder. The directory itself is
+    /// created lazily at save time (see `Session::handle_download`), not here.
+    pub fn download_dir_or_default(&self) -> PathBuf {
+        self.download_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("oxibrowser-downloads"))
+    }
+
     /// Create a minimal config with no rendering.
     pub fn headless() -> Self {
         Self {
@@ -368,6 +402,19 @@ impl BrowserConfigBuilder {
     /// Override the maximum number of concurrent sessions.
     pub fn max_sessions(mut self, max: usize) -> Self {
         self.inner.max_sessions = max;
+        self
+    }
+
+    /// Enable or disable Web API gap telemetry ([`BrowserConfig::telemetry`]).
+    pub fn telemetry(mut self, enabled: bool) -> Self {
+        self.inner.telemetry = enabled;
+        self
+    }
+
+    /// Dispose of the in-memory cookie jar on browser close
+    /// ([`BrowserConfig::clear_cookies_on_close`]).
+    pub fn cookies_on_close(mut self, enabled: bool) -> Self {
+        self.inner.clear_cookies_on_close = enabled;
         self
     }
 
@@ -535,6 +582,35 @@ mod tests {
     fn test_builder_max_sessions() {
         let cfg = BrowserConfig::builder().max_sessions(3).build();
         assert_eq!(cfg.max_sessions, 3);
+    }
+
+    #[test]
+    fn test_download_dir_default_resolution() {
+        // Unset → platform temp dir default (directory created at save time).
+        let cfg = BrowserConfig::default();
+        assert!(cfg.download_dir.is_none());
+        assert_eq!(
+            cfg.download_dir_or_default(),
+            std::env::temp_dir().join("oxibrowser-downloads")
+        );
+
+        // Explicit config wins.
+        let custom = PathBuf::from("/tmp/oxi-custom-dl");
+        let cfg = BrowserConfig {
+            download_dir: Some(custom.clone()),
+            ..BrowserConfig::default()
+        };
+        assert_eq!(cfg.download_dir_or_default(), custom);
+
+        // Serializes/deserializes through the TOML/JSON config surface.
+        let parsed: BrowserConfig =
+            serde_json::from_str(r#"{"download_dir":"/tmp/oxi-from-json"}"#).unwrap();
+        assert_eq!(
+            parsed.download_dir,
+            Some(PathBuf::from("/tmp/oxi-from-json"))
+        );
+        let parsed: BrowserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.download_dir, None, "missing key defaults to None");
     }
 
     #[test]

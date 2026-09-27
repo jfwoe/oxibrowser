@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3132,7 +3132,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-cdp"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-core"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3182,6 +3182,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -3197,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-render"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",

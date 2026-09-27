@@ -28,6 +28,9 @@ pub async fn execute(
 
 type ExecResult = Result<(Value, Option<String>), CliResponse>;
 
+// ExecResult's error variant embeds a full CliResponse payload by design —
+// the REPL surfaces structured errors to the agent, not strings.
+#[allow(clippy::result_large_err)]
 async fn execute_inner(
     cmd: SessionCommand,
     browser: &Browser,
@@ -448,6 +451,51 @@ async fn execute_inner(
             ))
         }
 
+        // ---- Storage state ----
+        SessionCommand::SaveState { path } => {
+            let (tab, tab_id) = get_active_tab(manager)?;
+            let state = tab.export_storage_state().await.map_err(|e| {
+                CliResponse::error(format!("{e}"), crate::output::core_error_code(&e))
+            })?;
+            let cookies = state["cookies"].as_array().map(|a| a.len()).unwrap_or(0);
+            let origins = state["origins"].as_array().map(|a| a.len()).unwrap_or(0);
+            let json = serde_json::to_string_pretty(&state)
+                .map_err(|e| CliResponse::error(format!("serialize failed: {e}"), "INTERNAL"))?;
+            let bytes = json.len();
+            std::fs::write(&path, &json)
+                .map_err(|e| CliResponse::error(format!("write failed: {e}"), "IO_ERROR"))?;
+            Ok((
+                serde_json::json!({
+                    "saved": path,
+                    "bytes": bytes,
+                    "cookies": cookies,
+                    "origins": origins,
+                }),
+                Some(tab_id),
+            ))
+        }
+
+        SessionCommand::LoadState { path } => {
+            let (tab, tab_id) = get_active_tab(manager)?;
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| CliResponse::error(format!("read failed: {e}"), "IO_ERROR"))?;
+            let state: Value = serde_json::from_str(&text)
+                .map_err(|e| CliResponse::error(format!("parse failed: {e}"), "PARSE_ERROR"))?;
+            let cookies = state["cookies"].as_array().map(|a| a.len()).unwrap_or(0);
+            let origins = state["origins"].as_array().map(|a| a.len()).unwrap_or(0);
+            tab.import_storage_state(state).await.map_err(|e| {
+                CliResponse::error(format!("{e}"), crate::output::core_error_code(&e))
+            })?;
+            Ok((
+                serde_json::json!({
+                    "loaded": path,
+                    "cookies": cookies,
+                    "origins": origins,
+                }),
+                Some(tab_id),
+            ))
+        }
+
         // ---- Help ----
         SessionCommand::Help => Ok((
             serde_json::json!({
@@ -473,6 +521,8 @@ async fn execute_inner(
                     "close <tab_id>",
                     "close --all",
                     "list",
+                    "save-state <path>",
+                    "load-state <path>",
                     "help",
                     "exit",
                 ]
@@ -495,4 +545,17 @@ fn get_tab(manager: &TabManager, tab_id: &str) -> Result<oxibrowser_core::Tab, C
         .get(tab_id)
         .cloned()
         .ok_or_else(|| CliResponse::error(format!("tab not found: {tab_id}"), "TAB_NOT_FOUND"))
+}
+
+/// Get the active tab (most recently created, e.g. `t2` over `t1`) for
+/// session-level commands that take no tab id. Errors if no tabs exist.
+#[allow(clippy::result_large_err)]
+fn get_active_tab(manager: &TabManager) -> Result<(oxibrowser_core::Tab, String), CliResponse> {
+    let tab_id = manager
+        .list()
+        .last()
+        .cloned()
+        .ok_or_else(|| CliResponse::error("no active tab: run 'new' first", "TAB_NOT_FOUND"))?;
+    let tab = get_tab(manager, &tab_id)?;
+    Ok((tab, tab_id))
 }

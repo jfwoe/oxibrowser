@@ -43,7 +43,7 @@ const MAX_TOTAL_COOKIES: usize = 3000;
 const MAX_COOKIE_VALUE_SIZE: usize = 4096;
 
 /// A parsed cookie entry with its attributes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CookieEntry {
     pub name: String,
     pub value: String,
@@ -51,6 +51,10 @@ pub struct CookieEntry {
     pub domain: Option<String>,
     pub secure: bool,
     pub http_only: bool,
+    /// Playwright `storageState` spells this `sameSite`; the alias keeps
+    /// older core-serialized snapshots (`same_site`) deserializable. Variant
+    /// values serialize as `"Strict"` / `"Lax"` / `"None"` (Playwright casing).
+    #[serde(rename = "sameSite", alias = "same_site")]
     pub same_site: Option<SameSite>,
     /// Raw parsed `Expires` attribute as Unix-epoch seconds.
     #[serde(default)]
@@ -413,6 +417,14 @@ impl CookieJar {
             return;
         }
 
+        self.commit_entry(entry, storage_domain);
+    }
+
+    /// Commit a fully-normalized entry: replace the existing cookie with the
+    /// same (name, path) under `storage_domain`, or append with the RFC 6265
+    /// count limits enforced. Shared by [`CookieJar::store`] and
+    /// [`CookieJar::insert_entry`].
+    fn commit_entry(&mut self, entry: CookieEntry, storage_domain: String) {
         // Replace existing cookie with same name and path, or append
         if let Some(existing) = self.cookies.get_mut(&storage_domain).and_then(|entries| {
             entries
@@ -445,6 +457,73 @@ impl CookieJar {
             entries.remove(0); // Evict oldest
         }
         entries.push(entry);
+    }
+
+    /// Insert an already-parsed [`CookieEntry`], merging with any existing
+    /// cookie that has the same (domain, name, path).
+    ///
+    /// Unlike [`CookieJar::store`] (which validates a live `Set-Cookie`
+    /// header against the request host), this accepts the entry as authored:
+    /// imported snapshots are trusted, so the Domain attribute is **not**
+    /// validated against a request host and public-suffix checks don't apply.
+    /// Normalization still happens: the domain is canonicalized (leading dot
+    /// stripped, lowercased; a missing domain falls back to the `"unknown"`
+    /// bucket, mirroring `cookies_for_url`), a missing/empty path defaults to
+    /// `/`, and `max_age`/`expires` are folded into the absolute `expiry` —
+    /// an already-expired entry deletes its stored match instead.
+    pub fn insert_entry(&mut self, mut entry: CookieEntry) {
+        // Enforce value size limit
+        if entry.value.len() > MAX_COOKIE_VALUE_SIZE {
+            entry.value.truncate(MAX_COOKIE_VALUE_SIZE);
+        }
+
+        // Storage domain: the cookie's own (canonicalized) Domain attribute,
+        // or the host-only `"unknown"` bucket when absent.
+        let storage_domain = match entry.domain.take() {
+            Some(cookie_domain) => {
+                let canonical = cookie_domain.trim_start_matches('.').to_lowercase();
+                entry.domain = Some(canonical.clone());
+                canonical
+            }
+            None => {
+                entry.domain = Some("unknown".to_string());
+                "unknown".to_string()
+            }
+        };
+
+        // CHIPS partition key (mirrors `store`).
+        if entry.partitioned {
+            entry.partition_key = Some(registrable_domain(&storage_domain));
+        }
+
+        // Default path: no request URL to derive the RFC 6265 default-path
+        // from, so imported cookies without a path scope to root.
+        if entry.path.is_none() || entry.path.as_deref() == Some("") {
+            entry.path = Some("/".to_string());
+        }
+
+        // Compute absolute expiry (same rules as `store`).
+        let now = now_epoch_secs();
+        if let Some(max_age) = entry.max_age {
+            if max_age <= 0 {
+                // Max-Age <= 0: delete any existing matching cookie and don't store.
+                self.remove_matching(&storage_domain, &entry.name, &entry.path);
+                return;
+            }
+            entry.expiry = Some(now.saturating_add(max_age));
+        } else if let Some(expires) = entry.expires {
+            entry.expiry = Some(expires);
+        } else {
+            entry.expiry = None; // session cookie — lives until the jar is dropped
+        }
+
+        // An already-expired entry deletes any existing match (RFC 6265 §5.4).
+        if entry.expiry.is_some_and(|exp| exp <= now) {
+            self.remove_matching(&storage_domain, &entry.name, &entry.path);
+            return;
+        }
+
+        self.commit_entry(entry, storage_domain);
     }
 
     /// Remove a cookie matching `(domain, name, path)`, if present.
@@ -597,6 +676,14 @@ impl CookieJar {
     /// Clear all cookies.
     pub fn clear(&mut self) {
         self.cookies.clear();
+    }
+
+    /// Clear all cookies and return how many were disposed. Teardown paths
+    /// use the count for the audit `session_teardown` event.
+    pub fn clear_and_count(&mut self) -> usize {
+        let n = self.cookies.len();
+        self.cookies.clear();
+        n
     }
 
     /// Number of stored cookie entries (by domain).
